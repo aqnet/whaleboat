@@ -1,0 +1,10 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# deps and build
+node_modules/
+
+# local data samples
+data/

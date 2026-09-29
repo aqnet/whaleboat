@@ -1,0 +1,11 @@
+{
+  "name": "whaleboat",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "ais:sample": "node scripts/ais-sample.ts"
+  }
+}
