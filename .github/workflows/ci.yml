@@ -1,0 +1,58 @@
+# Checks and tests that need no secrets and no network access to our services.
+#
+# Not run here: db/tests/storage_rules.sql, which needs a database connection.
+# Run it by hand against Supabase (it rolls itself back); see the file header.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    name: Web app
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Lint
+        run: npm run lint
+      - name: Unit tests
+        run: npm test
+      - name: Production build
+        run: npm run build
+
+  recorder-and-scripts:
+    name: Recorder and scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # >= 22.18 runs TypeScript files directly, as the recorder does in production.
+          node-version: 22
+      - name: Recorder end-to-end tests
+        run: node --test services/recorder/recorder.test.ts
+      - name: Script syntax
+        run: |
+          for f in scripts/*.ts services/recorder/recorder.ts; do node --check "$f"; done
+          for f in scripts/*.sh deploy/vm/*.sh; do bash -n "$f"; done

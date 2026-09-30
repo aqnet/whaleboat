@@ -8,6 +8,7 @@
   "scripts": {
     "ais:sample": "node scripts/ais-sample.ts",
     "depth:fetch": "node scripts/depth-fetch.ts",
-    "ais:backfill": "node scripts/ais-backfill.ts"
+    "ais:backfill": "node scripts/ais-backfill.ts",
+    "test": "npm --prefix web test && node --test services/recorder/recorder.test.ts"
   }
 }

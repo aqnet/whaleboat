@@ -146,6 +146,13 @@ async function loadWindowFromSupabase(since: number): Promise<SampleSummary> {
 }
 
 async function loadTracks(id: string, files: string[], since: number | null): Promise<SampleSummary> {
+  const texts = await Promise.all(files.map((f) => readFile(join(SAMPLES_DIR, f), "utf8")));
+  return tracksFromText(id, files, texts, since);
+}
+
+// Raw AISStream messages (JSON lines, as scripts/ais-sample.ts writes them)
+// -> per-vessel tracks. Pure, so it can be tested without files.
+export function tracksFromText(id: string, files: string[], texts: string[], since: number | null): SampleSummary {
   const acc = new Map<number, Acc>();
   let messages = 0;
   let positionReports = 0;
@@ -156,7 +163,6 @@ async function loadTracks(id: string, files: string[], since: number | null): Pr
     return v;
   };
 
-  const texts = await Promise.all(files.map((f) => readFile(join(SAMPLES_DIR, f), "utf8")));
   for (const line of texts.join("\n").split("\n")) {
     if (!line) continue;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- raw AISStream JSON; fields are checked where used
