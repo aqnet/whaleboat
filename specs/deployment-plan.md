@@ -1,265 +1,235 @@
-# Whaleboat — Deployment Plan (GCP, free tier)
+# Whaleboat — Deployment Plan (Cloud Run + Supabase)
 
-**Status:** Draft v0.1 · 2026-09-29
+**Status:** v0.2 · 2026-09-30 · **deployed** (web: https://whaleboat-web-594872122770.us-west1.run.app)
 **Owner:** Anderson
-**Goal:** Run all of Whaleboat in **one GCP/Firebase project** at **$0/month**, using free-tier allowances only.
+**Goal:** Host Whaleboat on **Google Cloud Run** (web) and a **free-tier VM** (recorder), with **Supabase** as the database: a live map with a rolling 48 h window, at about $0/month.
 
-> Items marked **⚠ VERIFY** are free-tier limits or product behaviors recalled from memory. Confirm them against current Google Cloud and Firebase documentation before relying on them. Free tiers change.
+> Items marked **⚠ VERIFY** are prices, limits or product behaviors that were not confirmed against current Google Cloud or Supabase documentation. Confirm them before relying on them.
 
-**Relationship to the tech spec:** this plan replaces the hosting choices in [whaleboat.md](whaleboat.md) §6 and §11 (Fly.io worker, Supabase, Vercel, R2). It assumes the **twice-daily batch publishing** model agreed after v0.4: there is no live push, now-cast or Realtime. The spec should be updated to v0.5 to match.
+### Changelog
+- **v0.2 (2026-09-30):** Replaced the v0.1 design (free-tier VM + SQLite + static Firebase Hosting, published twice a day) with **Cloud Run + Supabase**. Reasons: the map stays live, there is no VM to maintain, and Supabase is already set up. The cost is no longer $0 (§2). v0.1 is in git history (`7743cb8`).
+
+**Relationship to the tech spec:** this replaces the hosting choices in [whaleboat.md](whaleboat.md) §6 and §11 (Fly.io worker, Vercel, R2) and keeps Supabase. Storage differs from the spec (§11: registry vessels only, 90 days) and is defined in `db/migrations/`: most vessel types are stored, not only registry vessels; background traffic is kept **48 h**, and passenger vessels and named whale-watch boats **30 days** (§3.3).
 
 ---
 
 ## 1. Architecture
 
 ```
-One GCP project (region us-west1)
+GCP project (region us-west1)                        Supabase project
+│                                                    │
+├─ Cloud Run service   "whaleboat-web"               ├─ positions   (48 h / 30 d, pg_cron hourly)
+│    Next.js app + API routes, scales to zero   ───► ├─ vessels
+│      /api/tracks     → tracks_window()  (48 h)     ├─ sighting_logs
+│      /api/sightings  → operator sighting log       └─ functions: ingest_ais(), tracks_window()
+│                                                    ▲
+├─ Compute Engine e2-micro "whaleboat-vm"  (free tier) │
+│    Docker: recorder container, always on           │
+│    AISStream WebSocket → batches every 5 s   ──────┘
 │
-├─ Compute Engine e2-micro  "whaleboat-vm"  (Always Free)
-│    ├─ recorder   systemd service, always on
-│    │    AISStream WebSocket → SQLite (fixes) + hourly .jsonl.gz files
-│    ├─ batch      systemd timer, 13:00 and 22:00 America/Los_Angeles
-│    │    ├─ fetch Acartia sightings, iNaturalist, NOAA CO-OPS tides
-│    │    ├─ fixes → trips → loiters → encounters → hotspots  (SQLite/DuckDB)
-│    │    ├─ upload finished hourly raw files → Cloud Storage
-│    │    └─ write data JSON → deploy the "data" Hosting site
-│    └─ watchdog   systemd timer, every 15 min
-│         stale feed in daylight → error log entry → alert email
-│
-├─ Cloud Storage  gs://<project>-raw     raw AIS archive (private)
-├─ Firebase Hosting
-│    ├─ site "<project>"        the app (static Next.js export)
-│    └─ site "<project>-data"   published JSON, CORS-enabled for the app
-├─ Secret Manager               AISStream + Acartia keys
-└─ Cloud Logging / Monitoring   watchdog alert policy → email
+├─ Cloud Run Jobs + Cloud Scheduler   (later: trips, encounters, hotspots)
+├─ Artifact Registry                  container images
+├─ Secret Manager                     AISStream key, Supabase URL + secret key
+└─ Cloud Logging / Monitoring         recorder heartbeat → alert email
 ```
 
-**Data flow:** AISStream → recorder → SQLite on the VM disk → batch → JSON → Firebase Hosting CDN → browser. Raw fixes are also archived to Cloud Storage, so the working database can always be rebuilt.
+**Data flow:** AISStream → recorder → `ingest_ais()` → Supabase → `tracks_window()` → web API → browser. The browser never talks to Supabase or AISStream directly, and no key reaches it.
 
 ### 1.1 Key decisions
 
 | Decision | Choice | Why |
 |---|---|---|
-| Always-on ingest | **e2-micro VM** | AISStream is a push-only WebSocket with no history. The e2-micro is the only always-on compute in GCP's Always Free tier. The serverless alternative (a Cloud Run Job running all day) likely exceeds free compute. |
-| Working database | **SQLite (+ DuckDB for heavy queries) on the VM disk** | Free, and fast at this scale (≈ 1 GB/yr of fixes). A hosted database would mean another vendor, or free-tier write limits we'd exceed (Firestore). |
-| Raw archive | **Cloud Storage, us-west1** | Durable backup of every fix. Everything derived can be rebuilt from it. |
-| Front end | **Firebase Hosting, static export** | Free CDN in the same project. Firebase's server-rendering option (App Hosting) needs a paid plan, and the app doesn't need a server. |
-| Data delivery | **A second Hosting site** for JSON | The app and the data deploy independently: app releases come from the developer, data releases from the VM. A Hosting deploy replaces the whole site, so they can't share one. |
-| Publishing cadence | **Twice daily** | Matches the casual-app decision. Boats run in daylight, so 13:00 catches morning trips and 22:00 closes the day. |
+| Web app | **Cloud Run service**, request-based billing, min instances 0 | Keeps the API routes (no static export). Scales to zero, so casual traffic should fit the free tier. |
+| Always-on ingest | **Free-tier e2-micro VM** running the recorder container | AISStream is a push-only WebSocket with no history, so something must hold the connection all day. On Cloud Run that costs ≈ $45–50/mo (it ran there on 2026-09-30 for two hours); the e2-micro is free. Same image either way: the recorder still works as a Cloud Run service or worker pool if the VM ever becomes the problem. |
+| Database | **Supabase Postgres** | Cloud Run containers have no durable disk, so state has to live elsewhere. Already provisioned, with PostGIS and pg_cron. |
+| Writes | One RPC per batch (`ingest_ais`) | Merges vessel details and ignores duplicate positions in a single round trip. |
+| Reads | One RPC per view (`tracks_window`) | Returns the whole window as one JSON value, so PostgREST's row limit doesn't truncate it. |
+| Retention and filtering | **In the database**: `ingest_ais()` and an hourly pg_cron job | One place for every writer (§3.3). No scheduler or job needed on the GCP side. |
+| Sightings | Fetched on demand by the web app, cached 6 h, last good copy in `sighting_logs` | Small and slow-changing. Becomes a scheduled job only if more sources are added. |
+| Secrets | **Secret Manager**, mounted as environment variables | Nothing in images or the repo. |
 
 ---
 
-## 2. Free-tier budget
+## 2. Cost
 
-| Resource | Free allowance | Expected use | Status |
-|---|---|---|---|
-| e2-micro VM | 1 instance/month in us-west1, us-central1 or us-east1 | 1 instance, 24/7 | ✅ ⚠ VERIFY |
-| Standard persistent disk | 30 GB-months | 30 GB boot disk | ✅ at limit ⚠ VERIFY |
-| VM outbound transfer | 1 GB/month (North America) | Firebase deploys (~5 MB/day) + API calls, well under 1 GB | ✅ ⚠ VERIFY whether traffic to Google APIs counts |
-| **External IPv4 on the VM** | **Possibly not free**: Google charges for in-use external IPv4 addresses | 1 address | ⚠ **VERIFY. Biggest cost risk (≈ $3–4/mo if charged).** See §9. |
-| Cloud Storage (Standard, us-west1) | 5 GB-months + operation quotas | ≈ 1 GB/yr of raw; ~24 uploads/day | ✅ for several years ⚠ VERIFY |
-| Firebase Hosting | ~10 GB storage, ~360 MB/day transfer | App (~2 MB) + data (~40 MB/yr of day files); ~150 KB per page load | ✅ up to ~2,000 loads/day ⚠ VERIFY |
-| Secret Manager | A few active secret versions + access operations | 2 secrets, read at service start | ✅ ⚠ VERIFY |
-| Cloud Logging | 50 GiB/project/month | Watchdog entries only | ✅ |
-| Cloud Monitoring alerting | Free for log-based alerts at this volume | 1 policy | ✅ ⚠ VERIFY |
+| Item | Expected | Notes |
+|---|---|---|
+| Web service | ≈ $0 | Free tier ⚠ VERIFY (recalled: 2M requests, 180k vCPU-s, 360k GiB-s per month). |
+| Recorder VM (e2-micro, 30 GB standard disk) | **≈ $0** | Free tier: one e2-micro in us-west1, 30 GB-months of standard disk. The external IP is free for the first 720 h/month, then $0.005/h (≈ $0.12 in a 31-day month). Egress to Supabase is roughly 1 GB/month, around the 1 GB free allowance. Running the recorder on Cloud Run instead would be ≈ $45–50/mo (1 vCPU minimum when CPU is always allocated; $0.000018/vCPU-s) or ≈ $31/mo as a worker pool. |
+| Artifact Registry | ≈ $0 | Two images, ~110 MB (web) and ~80 MB (recorder). 0.5 GB free ⚠ VERIFY. |
+| Secret Manager, Logging, Scheduler | ≈ $0 | Three secrets; heartbeat logs only. |
+| Supabase | $0, then **$25/mo (Pro)** | Free tier is 500 MB. See risk 1: all vessels for 30 days may exceed it. |
 
-**Guardrails (set these up in Phase 0):**
-- A **billing budget of $1** with alerts at 50% and 100%. A billing account is required even for free-tier use; with billing linked, Firebase calls the project "Blaze", and the no-cost Hosting quotas still apply.
-- Create everything in **us-west1**, using **standard** (not balanced or SSD) persistent disk.
-- **Firebase Hosting release retention: keep ~5 releases per site.** Twice-daily data deploys otherwise pile up old versions against storage. ⚠ VERIFY where this setting lives (Hosting console → release storage).
-- No Cloud NAT, load balancer, Cloud SQL, or snapshot schedules. None of them are free.
+**Guardrails:** a billing budget of **$20/mo** with alerts at 50% and 100%; `--max-instances 2` on the web service; exactly 1 recorder instance.
 
 ---
 
 ## 3. Components
 
-### 3.1 Recorder (`whaleboat-recorder.service`)
-Grows out of `scripts/ais-sample.ts`:
-- Subscribes to AISStream for the region box, filtering by the registry MMSI list once the registry exists.
-- Applies the spec's ingest validation (§7.1) and 30-second downsampling. Keeps every fix under 3 kn, and every fix where speed changes by more than 2 kn.
-- Writes fixes to SQLite (`/var/lib/whaleboat/whaleboat.db`) and appends raw messages to `/var/lib/whaleboat/raw/YYYY/MM/DD/HH.jsonl`, then gzips each file when its hour ends.
-- Reconnects with exponential backoff and jitter. Exits non-zero after repeated failures so systemd restarts it (`Restart=always`, `RestartSec=30`).
-- Writes a heartbeat timestamp (`/var/lib/whaleboat/heartbeat`) on every message.
-- Memory cap: `MemoryMax=300M` in the unit, which leaves room for the batch on a 1 GB VM.
+### 3.1 Web (`web/`, service `whaleboat-web`)
+- Image: `web/Dockerfile` (Next.js `output: "standalone"`, listens on `PORT`, runs as non-root).
+- Reads the 48 h window from Supabase when `SUPABASE_URL` and `SUPABASE_SECRET_KEY` are set. The local-sample fallback only applies in development.
+- The depth basemap's data (`web/public/depth/`) is gitignored. Run `npm run depth:fetch` before building so it is in the image; `web/.gcloudignore` makes sure `gcloud` uploads it.
 
-### 3.2 Batch (`whaleboat-batch.timer` → `.service`)
-Runs at **13:00 and 22:00 America/Los_Angeles** (`OnCalendar=*-*-* 13,22:00:00 America/Los_Angeles`, `Persistent=true`):
-1. Fetches sources: Acartia (full ~7-day window, updated in place by id), iNaturalist (daily), NOAA tide predictions (monthly, cached).
-2. Runs the shared track package (trip segmentation, loiter detection, time-aware simplification), then encounters. Recomputes hotspots on the 22:00 run only.
-3. Uploads completed raw hourly files to `gs://<project>-raw/ais/YYYY/MM/DD/HH.jsonl.gz` and marks them uploaded.
-4. Writes the data site (§4) to `/var/lib/whaleboat/publish/` and deploys it with `firebase deploy --only hosting:data`.
-5. Logs a summary line (counts, duration). Any failure exits non-zero, which the watchdog reports.
+### 3.2 Recorder (`services/recorder/`, on VM `whaleboat-vm`)
+- Runs in Docker on the free-tier VM, started by `deploy/vm/recorder-startup.sh` (the VM's startup script, re-run on every boot). It pulls `whaleboat-recorder:latest`, reads the three secrets from Secret Manager into `/run` (tmpfs), and passes them to the container as files (`*_FILE` variables), so no key is written to disk. Logs reach Cloud Logging via Docker's `gcplogs` driver (log `gcplogs-docker-driver`, message in `jsonPayload.message`).
+- A reboot restores it without intervention (tested: reconnected 48 s after a reset).
+- One dependency-free TypeScript file run directly by Node 22.
+- Subscribes to one box covering Port Angeles east to Everett and Tacoma north to the San Juans (`AIS_BBOX` overrides it).
+- Flushes to `ingest_ais()` every 5 s. A failed write is retried with the next batch; at most 50,000 positions are held in memory.
+- Reconnects with exponential backoff and jitter (1 s → 60 s), and forces a reconnect after 3 min of silence.
+- Logs JSON lines, with a `heartbeat` entry every 5 min carrying message, stored, dropped and error counts.
+- On SIGTERM it flushes and exits within Cloud Run's 10 s window.
 
-The 22:00 run also purges non-registry `candidate_positions` older than 14 days and fixes older than the retention window (spec §6.2).
+### 3.3 What gets stored (`db/migrations/20260930170000_storage_diet.sql`)
+Measured on the first morning: ~11k positions/hour, ~80% from boats that weren't moving, which projects to ~1.3 GB over 30 days. The rules, all enforced in the database:
+- **Types never stored:** tugs/towing, cargo, tankers, military, pilot/SAR/law enforcement and similar service craft (`ais_type_excluded()`). Kept: passenger, fishing, sailing, pleasure craft, and vessels whose type isn't known yet.
+- **Stationary thinning:** a boat under 0.5 kn is stored at most once every 15 minutes.
+- **Retention:** 48 h for everything; 30 days for passenger types (60–69) and the named whale-watch boats (`keeps_30_days()`; keep its name list in step with `web/lib/whaleWatch.ts`).
+- The `geom` column was dropped until PostGIS queries need it.
 
-### 3.3 Watchdog (`whaleboat-watchdog.timer`, every 15 min)
-- Reads the heartbeat. During daylight (sunrise−1 h to sunset+1 h), if it's older than 15 min, **or** the last batch run failed, it writes an error entry: `gcloud logging write whaleboat-watchdog "<reason>" --severity=ERROR`.
-- A **log-based alert policy** on `logName=".../whaleboat-watchdog" AND severity>=ERROR` emails the owner.
-- This needs no Ops Agent, keeping the 1 GB VM's memory for the recorder.
+### 3.4 Alerting
+- A **log-based metric** counting the recorder's `heartbeat` entries, and an **alert policy** that emails when none arrive for 15 min.
+- A second policy on `severity>=ERROR` from the recorder (failed Supabase writes, AISStream errors).
 
-### 3.4 App (Firebase Hosting site `<project>`)
-- The Next.js app with `output: "export"`. The API route handlers are removed, and the app fetches JSON from the data site (`NEXT_PUBLIC_DATA_BASE_URL`).
-- Built and deployed from the developer machine (or CI later) with `firebase deploy --only hosting:app`.
-
----
-
-## 4. Published data (Firebase Hosting site `<project>-data`)
-
-| Path | Contents | Written by |
-|---|---|---|
-| `/v1/status.json` | `generated_at`, last fix time, source health, coverage window | every batch |
-| `/v1/tracks-48h.json` | Registry vessel trips intersecting the last 48 h (`path_simple`, deck.gl format) | every batch |
-| `/v1/sightings-48h.json` | Normalized, policy-filtered sightings (spec §10) | every batch |
-| `/v1/days/YYYY-MM-DD.json` | One day's trips (`path_overview`) + sightings + encounters, for history views | every batch (today); past days are immutable |
-| `/v1/hotspots.json` | Hotspot cells by month × species and month × tide (spec §7.4) | 22:00 batch |
-| `/v1/coverage.json` | Date ranges with data per source, for the coverage strip (spec §8.5) | every batch |
-
-**`firebase.json` headers for the data site:**
-- `Access-Control-Allow-Origin: https://<project>.web.app` (plus the custom domain, if added).
-- `Cache-Control`: `public, max-age=300, must-revalidate` for `status`, `*-48h`, `hotspots` and `coverage`; `public, max-age=31536000, immutable` for past `days/*`.
+### 3.5 Jobs (not built yet)
+Trips, loiters, encounters and hotspots (spec §7) will run as **Cloud Run Jobs** on **Cloud Scheduler**, reading and writing Supabase.
 
 ---
 
-## 5. Security
-
-- **No public SSH.** The VM firewall allows port 22 only from IAP's range (`35.235.240.0/20`). Connect with `gcloud compute ssh --tunnel-through-iap`, which is free.
-- **Dedicated service account** `whaleboat-vm@` with least privilege:
-  - `roles/storage.objectCreator` on the raw bucket only (plus `objectViewer` for restores),
-  - `roles/secretmanager.secretAccessor` on the two secrets only,
-  - `roles/firebasehosting.admin` (for data-site deploys),
-  - `roles/logging.logWriter`.
-- **Secrets** are read from Secret Manager at service start into memory. They never go on disk or into the repo.
-- **Unattended upgrades** on the VM (Debian `unattended-upgrades`, security updates only).
-- **Raw bucket:** uniform bucket-level access, public access prevention enforced.
-- The SRKW disclosure policy (spec §10) is applied **in the batch**, before JSON is published. Nothing unfiltered is ever served.
+## 4. Security
+- The web service is public (`--allow-unauthenticated`). The recorder has no inbound endpoint.
+- Two service accounts: `whaleboat-web@` (Supabase secrets only) and `whaleboat-recorder@` (all three secrets). Each gets `roles/secretmanager.secretAccessor` on just its secrets.
+- Supabase tables have row-level security on with no policies, and the functions are executable by the service role only. The publishable key can read nothing.
+- The SRKW disclosure policy (spec §10) has to be enforced in the API routes before any sighting locations are served. The current sighting log has no locations.
 
 ---
 
-## 6. Setup runbook
+## 5. Setup runbook
 
-> Replace `<project>` with a globally unique id (e.g. `whaleboat-aq`) and `<billing>` with your billing account id. Run from the dev machine with `gcloud` and `firebase-tools` installed.
+> Replace `<project>` and `<billing>`. Needs the `gcloud` CLI, which is not yet installed on the dev VM.
 
 ### Phase 0: Project and guardrails
 ```bash
 gcloud projects create <project> --name="Whaleboat"
 gcloud billing projects link <project> --billing-account=<billing>
 gcloud config set project <project>
-gcloud services enable compute.googleapis.com storage.googleapis.com \
-  secretmanager.googleapis.com logging.googleapis.com monitoring.googleapis.com \
-  firebasehosting.googleapis.com iap.googleapis.com
+gcloud config set run/region us-west1
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com \
+  secretmanager.googleapis.com cloudscheduler.googleapis.com logging.googleapis.com monitoring.googleapis.com
 
-# $1 budget with alerts at 50% and 100%
 gcloud billing budgets create --billing-account=<billing> --display-name="whaleboat-guardrail" \
-  --budget-amount=1USD --threshold-rule=percent=0.5 --threshold-rule=percent=1.0
-
-firebase projects:addfirebase <project>
-firebase hosting:sites:create <project>-data
+  --budget-amount=20USD --threshold-rule=percent=0.5 --threshold-rule=percent=1.0
 ```
 
-### Phase 1: Storage, secrets, service account
+### Phase 1: Secrets and service accounts
 ```bash
-gcloud storage buckets create gs://<project>-raw --location=us-west1 \
-  --default-storage-class=STANDARD --uniform-bucket-level-access --public-access-prevention
+# Paste each value on stdin, then Ctrl-D. Never put secrets on the command line.
+for s in aisstream-api-key supabase-url supabase-secret-key; do
+  gcloud secrets create $s --replication-policy=user-managed --locations=us-west1
+  gcloud secrets versions add $s --data-file=-
+done
 
-gcloud iam service-accounts create whaleboat-vm --display-name="Whaleboat VM"
-SA=whaleboat-vm@<project>.iam.gserviceaccount.com
+gcloud iam service-accounts create whaleboat-web
+gcloud iam service-accounts create whaleboat-recorder
+WEB=whaleboat-web@<project>.iam.gserviceaccount.com
+REC=whaleboat-recorder@<project>.iam.gserviceaccount.com
 
-# Secrets (paste values via stdin; never on the command line)
-gcloud secrets create aisstream-api-key --replication-policy=user-managed --locations=us-west1
-gcloud secrets versions add aisstream-api-key --data-file=-
-gcloud secrets create acartia-token --replication-policy=user-managed --locations=us-west1
-gcloud secrets versions add acartia-token --data-file=-
-
-gcloud secrets add-iam-policy-binding aisstream-api-key --member=serviceAccount:$SA --role=roles/secretmanager.secretAccessor
-gcloud secrets add-iam-policy-binding acartia-token    --member=serviceAccount:$SA --role=roles/secretmanager.secretAccessor
-gcloud storage buckets add-iam-policy-binding gs://<project>-raw --member=serviceAccount:$SA --role=roles/storage.objectCreator
-gcloud storage buckets add-iam-policy-binding gs://<project>-raw --member=serviceAccount:$SA --role=roles/storage.objectViewer
-gcloud projects add-iam-policy-binding <project> --member=serviceAccount:$SA --role=roles/firebasehosting.admin
-gcloud projects add-iam-policy-binding <project> --member=serviceAccount:$SA --role=roles/logging.logWriter
+for s in supabase-url supabase-secret-key; do
+  gcloud secrets add-iam-policy-binding $s --member=serviceAccount:$WEB --role=roles/secretmanager.secretAccessor
+done
+for s in aisstream-api-key supabase-url supabase-secret-key; do
+  gcloud secrets add-iam-policy-binding $s --member=serviceAccount:$REC --role=roles/secretmanager.secretAccessor
+done
 ```
 
-### Phase 2: VM
+### Phase 2: Database
+Apply everything in `db/migrations/` to the Supabase project. Both current migrations were applied on 2026-09-30.
+
+### Phase 3: Recorder (free-tier VM)
 ```bash
-gcloud compute instances create whaleboat-vm --zone=us-west1-b --machine-type=e2-micro \
-  --image-family=debian-12 --image-project=debian-cloud \
-  --boot-disk-size=30GB --boot-disk-type=pd-standard \
-  --service-account=$SA --scopes=cloud-platform
+gcloud services enable compute.googleapis.com
+REC=whaleboat-recorder@<project>.iam.gserviceaccount.com
 
-gcloud compute firewall-rules create allow-iap-ssh --network=default \
-  --direction=INGRESS --action=allow --rules=tcp:22 --source-ranges=35.235.240.0/20
-# Remove the default rule that allows SSH from anywhere, if present:
-gcloud compute firewall-rules delete default-allow-ssh --quiet || true
+# Build the image on Cloud Build (amd64; the dev VM is arm64).
+gcloud builds submit services/recorder --region=us-west1 \
+  --tag us-west1-docker.pkg.dev/<project>/cloud-run-source-deploy/whaleboat-recorder:latest
 
-gcloud compute ssh whaleboat-vm --zone=us-west1-b --tunnel-through-iap
+# The VM's account pulls the image and writes logs.
+gcloud artifacts repositories add-iam-policy-binding cloud-run-source-deploy --location=us-west1 \
+  --member=serviceAccount:$REC --role=roles/artifactregistry.reader
+gcloud projects add-iam-policy-binding <project> --member=serviceAccount:$REC --role=roles/logging.logWriter
+
+# No inbound access except SSH through IAP.
+gcloud compute firewall-rules delete default-allow-ssh default-allow-rdp --quiet
+gcloud compute firewall-rules create allow-ssh-from-iap --network=default --direction=INGRESS \
+  --action=allow --rules=tcp:22 --source-ranges=35.235.240.0/20
+
+# us-west1-b had no e2-micro capacity on 2026-09-30; us-west1-a worked.
+gcloud compute instances create whaleboat-vm --zone=us-west1-a --machine-type=e2-micro \
+  --image-family=debian-12 --image-project=debian-cloud --boot-disk-size=30GB --boot-disk-type=pd-standard \
+  --service-account=$REC --scopes=cloud-platform \
+  --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
+  --metadata-from-file=startup-script=deploy/vm/recorder-startup.sh --metadata=enable-oslogin=TRUE
 ```
-On the VM:
-- Add a 2 GB swapfile. The 1 GB of RAM is tight for `npm ci` and the batch.
-- Install Node 22 LTS, `sqlite3`, `firebase-tools` and `unattended-upgrades`, and set the timezone to `America/Los_Angeles`.
-- Create a `whaleboat` system user, and `/var/lib/whaleboat/{raw,publish}` owned by it.
-- Deploy the code: `git clone` into `/opt/whaleboat` and run `npm ci --omit=dev`.
-- Install the systemd units (`whaleboat-recorder.service`, `whaleboat-batch.{service,timer}`, `whaleboat-watchdog.{service,timer}`) from `deploy/systemd/` in the repo, then `systemctl enable --now` them.
-- ⚠ VERIFY that `firebase deploy` authenticates on the VM using the attached service account (Application Default Credentials) with no interactive login. If not, use the Firebase Hosting REST API from the batch instead.
+Check: a "Connected to AISStream" entry in log `gcplogs-docker-driver` within ~3 min, and rows arriving in `positions`.
 
-### Phase 3: Hosting
-- `firebase.json` with two targets: `app` → site `<project>`, `data` → site `<project>-data`, with the headers from §4.
-- App: `cd web && npm run build` (static export to `out/`), then `firebase deploy --only hosting:app`.
-- Data: the first deploy comes from the batch. Check `https://<project>-data.web.app/v1/status.json`.
-- Set release retention to ~5 on both sites.
+### Phase 4: Web
+```bash
+npm run depth:fetch            # repo root; puts depth data in web/public/depth/
+gcloud run deploy whaleboat-web --source web \
+  --service-account=$WEB --allow-unauthenticated --min-instances=0 --max-instances=2 \
+  --cpu=1 --memory=512Mi \
+  --set-secrets=SUPABASE_URL=supabase-url:latest,SUPABASE_SECRET_KEY=supabase-secret-key:latest
+```
+Check: the service URL loads the map, and the panel's summary line starts with "Supabase ·".
 
-### Phase 4: Alerting
-- Create the log-based alert policy (§3.3) with an email notification channel.
-- Test it: run `gcloud logging write whaleboat-watchdog "test" --severity=ERROR` on the VM and confirm the email arrives.
+### Phase 5: Alerts
+Create the log-based metric and the two alert policies in §3.4 (console: Logging → Log-based metrics, then Monitoring → Alerting).
+
+### Phase 6 (optional): Custom domain
+`gcloud beta run domain-mappings create --service whaleboat-web --domain <domain>` ⚠ VERIFY availability in us-west1; otherwise put a load balancer or Firebase Hosting rewrite in front.
 
 ---
 
-## 7. Operations
+## 6. Operations
 
 | Task | How |
 |---|---|
-| Check health | `https://<project>-data.web.app/v1/status.json`; `journalctl -u whaleboat-recorder -f` over IAP SSH |
-| Deploy new VM code | SSH → `cd /opt/whaleboat && git pull && npm ci --omit=dev && sudo systemctl restart whaleboat-recorder` |
-| Deploy new app | `cd web && npm run build && firebase deploy --only hosting:app` |
-| Roll back the app | Firebase console → Hosting → release history → Rollback |
-| Rebuild the working DB | Stop the recorder; replay `gs://<project>-raw/ais/**` through the track package into a fresh SQLite file; start the recorder |
-| Backfill history (MarineCadastre) | Run on the **dev machine**, not the e2-micro (DuckDB needs more RAM). Upload results as `days/*.json` via a data deploy |
-| Rotate a key | `gcloud secrets versions add …`, then restart the recorder |
+| Deploy new web code | Re-run the Phase 4 `gcloud run deploy` |
+| Deploy new recorder code | Re-run the Phase 3 `gcloud builds submit`, then `gcloud compute instances reset whaleboat-vm --zone=us-west1-a` (≈ 1 min gap in the feed) |
+| Shell on the VM | `gcloud compute ssh whaleboat-vm --zone=us-west1-a --tunnel-through-iap` |
+| Roll back | `gcloud run services update-traffic whaleboat-web --to-revisions=<rev>=100` |
+| Schema change | Add a file under `db/migrations/`, apply it to Supabase, then deploy code that uses it |
+| Rotate a key | `gcloud secrets versions add …`, then redeploy the service that uses it |
+| Check the feed | Logs Explorer: `logName:"gcplogs-docker-driver" jsonPayload.message:"heartbeat"` |
 
-**Backups:** the raw archive in Cloud Storage is the backup. The SQLite database and all published JSON are derived from it. Disk snapshots aren't used, because they aren't free.
-
----
-
-## 8. Code changes required
-
-1. **`web/`: static export.** `output: "export"` in `next.config.ts`. Delete `app/api/*` route handlers. Fetch from `NEXT_PUBLIC_DATA_BASE_URL`. Replace the sample picker with the time window control (spec §8.5).
-2. **Shared track package.** Move parsing and track logic out of `web/lib/ais.ts` into a package that both the VM services and the app types use (spec §6.1).
-3. **Recorder.** Harden `scripts/ais-sample.ts` into the service in §3.1: SQLite, hourly rotation, reconnect, heartbeat, secrets from Secret Manager.
-4. **Batch.** New: sources → tracks → encounters → hotspots → JSON → raw upload → Hosting deploy.
-5. **`deploy/`.** systemd units, `firebase.json`, `.firebaserc`, and a VM bootstrap script covering Phase 2's on-VM steps.
-6. **Sightings code.** `web/lib/sightings.ts` and `web/app/api/sightings/route.ts` move into the batch. The panel reads `sightings-48h.json`.
+**Backups:** Supabase's own backups (daily on Pro ⚠ VERIFY for the free tier). There is no raw archive in this design: a recorder outage loses that period's positions for good. If that matters, add an hourly raw dump to Cloud Storage.
 
 ---
 
-## 9. Risks and open questions
+## 7. Code status
 
-1. **External IPv4 charge (⚠ VERIFY first).** If the free-tier VM's external IP is billed (≈ $3–4/mo), the options are:
-   - accept it (the whole stack is still ≈ $4/mo);
-   - go **IPv6-only**, if AISStream, Acartia and NOAA all support IPv6 (⚠ VERIFY each);
-   - or move ingest to the serverless option (Cloud Run Job), with its own compute cost.
-   Cloud NAT is not an option: it isn't free.
-2. **1 GB RAM.** The recorder and batch must stay lean: stream-process files, and use no in-memory whole-day arrays. Swap covers spikes. Heavy work (backfill, hotspot rebuilds over years) runs on the dev machine.
-3. **AISStream coverage.** The 2026-09-29 sample showed almost no reception in Saratoga Passage and Port Susan. Hosting doesn't fix that; the Camano receiver (spec Phase 3) does. When it exists, AIS-catcher can POST batches straight to the VM, or to a small Cloud Run endpoint.
-4. **Single VM, single zone.** A zone outage or VM failure loses live data until it's restored. That's acceptable for a casual app: the raw archive preserves everything up to the last hourly upload.
-5. **Free-tier drift.** Google has changed these allowances before. The $1 budget alert is the early warning.
-6. **Firebase deploy from the VM (⚠ VERIFY).** If authenticating with the service account doesn't work unattended, fall back to the Hosting REST API.
-
----
-
-## 10. Alternatives considered
-
-| Option | Why not (for now) |
+| Item | Status |
 |---|---|
-| Vercel front end + GCP data | Works well, but two vendors. Rejected for "all in one place". |
-| Fly.io worker + Supabase + Vercel (spec v0.4) | ~$30/mo, three vendors. |
-| Cloud Run Job ingest (serverless) | Holding the stream ~17 h/day likely exceeds Cloud Run's free compute. Revisit if the VM's external IP turns out to be billed. |
-| AWS Lambda relay + S3/DynamoDB + CloudFront | Fully serverless at $0 using a chain of 15-minute Lambdas. More moving parts, and it's not the chosen single platform. |
-| Cloudflare Durable Objects + R2 + Pages | Elegant single platform, but uncertain free-plan limits for an always-connected object and for batch CPU time. |
+| `db/migrations/*_ais_positions.sql`, `*_sighting_logs.sql` | Done, applied 2026-09-30 |
+| `services/recorder/` (service + Dockerfile) | Done. Container tested against stand-in AIS and database servers: reconnect, retry and storage all worked. **Not yet run against the real AISStream and Supabase.** |
+| `web/Dockerfile`, standalone output | Done. Image builds (arm64 locally; Cloud Build produces amd64) and serves the page, static files and API routes. **Not yet run with real Supabase credentials.** |
+| Web reads the 48 h window from Supabase | Done, with a local-file fallback for development |
+| Sightings snapshot in Supabase | Done |
+| Hide the per-sample picker in production | To do |
+| Backfill of the 2026-09-29 local samples | To do (optional) |
+| Alert policies | To do (Phase 5) |
+| Jobs for trips, encounters, hotspots | To do (spec Phase 1) |
+
+---
+
+## 8. Risks and open questions
+
+1. **Supabase storage.** The rules in §3.3 are meant to keep `positions` well under the free tier's 500 MB, but the steady-state size is a projection. **Measure after two full days** (`select pg_total_relation_size('positions')`), once the 48 h window has filled. Further levers: a longer thinning interval, excluding more types, or a smaller region.
+2. **Recorder VM.** Free-tier limits (one e2-micro per billing account, 30 GB standard disk, 720 free external-IP hours) are Google's to change; the $20 budget alert is the early warning. The VM needs occasional care: Debian security updates (enable `unattended-upgrades`) and a reboot now and then.
+3. **Shared Supabase project.** The project also holds another app's (empty) tables. Move Whaleboat to its own project before a public launch.
+4. **AISStream reliability and coverage.** No SLA, and the 2026-09-29 sample showed little reception in Saratoga Passage and Port Susan. Hosting doesn't fix that; the Camano receiver (spec Phase 3) does.
+5. **One recorder instance, one region.** A crash or redeploy leaves a short gap. Acceptable for now; Cloud Run restarts it.
+6. **Terms of use.** Confirm AISStream allows public redistribution (spec §13.6), and credit NOAA for the depth data with a "not for navigation" note.
+7. **Spec drift.** `whaleboat.md` still describes Fly.io, Vercel and registry-only storage. It should be updated to v0.5 to match this plan.

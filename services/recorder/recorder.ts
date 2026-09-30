@@ -1,14 +1,16 @@
 // Long-running AIS recorder: AISStream WebSocket -> Supabase.
 //
-// The always-on counterpart of scripts/ais-sample.ts, built to run as a Cloud
-// Run worker pool (specs/deployment-plan.md). It holds one outbound WebSocket,
+// The always-on counterpart of scripts/ais-sample.ts. Runs in Docker on the
+// free-tier VM (deploy/vm/, specs/deployment-plan.md); also works as a Cloud
+// Run service. It holds one outbound WebSocket,
 // batches position reports and vessel details, and writes them with the
 // ingest_ais() function (db/migrations/*_ais_positions.sql).
 //
 //   node services/recorder/recorder.ts
 //
 // Environment:
-//   AISSTREAM_API_KEY, SUPABASE_URL, SUPABASE_SECRET_KEY   required
+//   AISSTREAM_API_KEY, SUPABASE_URL, SUPABASE_SECRET_KEY   required; or
+//              *_FILE variants pointing at files that hold the values
 //   AIS_BBOX   "south,west,north,east"; default is the puget-sound box plus
 //              the whale-watch box from scripts/ais-sample.ts
 //   PORT       if set (Cloud Run *service*), serves a health check on it
@@ -17,6 +19,7 @@
 // No dependencies: Node >= 22.18 runs this file directly and has WebSocket
 // and fetch built in. Logs are JSON lines, which Cloud Logging parses.
 
+import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 
 type BBox = [[number, number], [number, number]]; // [[lat, lon] SW, [lat, lon] NE]
@@ -46,8 +49,12 @@ function log(severity: "INFO" | "WARNING" | "ERROR", message: string, extra: Rec
   console.log(JSON.stringify({ severity, message, ...extra, time: new Date().toISOString() }));
 }
 
+// NAME_FILE (a path) takes precedence over NAME, so a host can hand secrets
+// over as files in memory rather than as container environment variables,
+// which Docker writes to disk.
 function required(name: string): string {
-  const v = process.env[name];
+  const file = process.env[`${name}_FILE`];
+  const v = file ? readFileSync(file, "utf8").trim() : process.env[name];
   if (!v) {
     log("ERROR", `Missing environment variable ${name}`);
     process.exit(1);
