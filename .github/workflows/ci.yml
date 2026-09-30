@@ -25,15 +25,17 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
       - name: Typecheck
-        run: npx tsc --noEmit
+        # next typegen writes the route types (LayoutProps etc.) that a fresh
+        # checkout doesn't have yet; tsc alone fails without them.
+        run: npm run typecheck
       - name: Lint
         run: npm run lint
       - name: Unit tests
@@ -45,8 +47,8 @@ jobs:
     name: Recorder and scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           # >= 22.18 runs TypeScript files directly, as the recorder does in production.
           node-version: 22
