@@ -8,6 +8,9 @@ import type { PickingInfo } from "@deck.gl/core";
 import { setWorkerUrl, type Map as MapLibreMap } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import type { Fix, SampleFile, SampleSummary, VesselTrack } from "@/lib/ais";
+
+// Mirrors WINDOW_ID in lib/ais.ts, which can't be imported here (it uses node:fs).
+const WINDOW_ID = "last-48h";
 import { OPERATORS } from "@/lib/whaleWatch";
 import SightingsPanel from "./SightingsPanel";
 
@@ -21,8 +24,32 @@ const BASEMAPS = {
   light: { label: "Light", url: "https://tiles.openfreemap.org/styles/positron", dark: false },
   streets: { label: "Streets", url: "https://tiles.openfreemap.org/styles/liberty", dark: false },
   dark: { label: "Dark", url: "https://tiles.openfreemap.org/styles/dark", dark: true },
+  depth: { label: "Depth", url: "https://tiles.openfreemap.org/styles/positron", dark: false },
 } as const;
 type BasemapId = keyof typeof BASEMAPS;
+
+// Depth basemap: NOAA chart depth areas and contours, downloaded by
+// `npm run depth:fetch` into public/depth/. Bands follow the charts' fathom
+// steps (3, 10, 20, 50, 100 fathoms), keyed on each area's shallowest depth.
+// The blues stay pale so the Class A/B track colors still read on top.
+const DEPTH_BANDS = [
+  { min: -Infinity, label: "Dries at low tide", color: "#e8e2cf" },
+  { min: 0, label: "0–5 m", color: "#e6f1f8" },
+  { min: 5.4, label: "5–18 m", color: "#d3e6f3" },
+  { min: 18.2, label: "18–37 m", color: "#bfd9ec" },
+  { min: 36.5, label: "37–91 m", color: "#a9cae3" },
+  { min: 91.4, label: "91–183 m", color: "#94bad8" },
+  { min: 182.8, label: "183 m +", color: "#80a9cb" },
+];
+// ["step", input, color0, stop1, color1, ...]
+const DEPTH_FILL = [
+  "step",
+  ["coalesce", ["get", "DRVAL1"], 0],
+  DEPTH_BANDS[0].color,
+  ...DEPTH_BANDS.slice(1).flatMap((b) => [b.min, b.color]),
+] as unknown as string;
+// Draw right above the basemap's own water, so land use, roads and labels stay on top.
+const DEPTH_BEFORE = "landcover_ice_shelf";
 
 const NOAA_WMS =
   "https://gis.charttools.noaa.gov/arcgis/rest/services/MCS/NOAAChartDisplay/MapServer/exts/MaritimeChartService/WMSServer" +
@@ -97,7 +124,7 @@ function shipTypeLabel(t: number | null): string {
 export default function BoatMap() {
   const mapRef = useRef<MapRef>(null);
   const [samples, setSamples] = useState<SampleFile[]>([]);
-  const [file, setFile] = useState<string | null>(null);
+  const [file, setFile] = useState<string | null>(WINDOW_ID);
   const [data, setData] = useState<SampleSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [basemap, setBasemap] = useState<BasemapId>("light");
@@ -114,22 +141,20 @@ export default function BoatMap() {
   const theme = BASEMAPS[basemap].dark ? "dark" : "light";
 
   useEffect(() => {
+    load(WINDOW_ID);
+  }, []);
+
+  // The window view also re-lists samples, so a pull started after the page
+  // loaded shows up on the next reload.
+  function load(f: string) {
     fetch("/api/samples")
       .then((r) => r.json())
       .then((list: SampleFile[]) => {
         setSamples(list);
-        if (list.length) {
-          setFile(list[0].file);
-          load(list[0].file);
-        } else {
-          setError("No samples yet. Run `npm run ais:sample` in the repo root.");
-        }
+        if (!list.length) setError("No samples yet. Run `npm run ais:sample` in the repo root.");
       })
       .catch((e) => setError(String(e)));
-  }, []);
-
-  function load(f: string) {
-    fetch(`/api/tracks?file=${encodeURIComponent(f)}`)
+    fetch(f === WINDOW_ID ? "/api/tracks" : `/api/tracks?file=${encodeURIComponent(f)}`)
       .then(async (r) => {
         const body = await r.json();
         if (!r.ok) throw new Error(body.error ?? r.statusText);
@@ -205,7 +230,7 @@ export default function BoatMap() {
   const getTooltip = ({ object, layer }: PickingInfo) => {
     if (!object) return null;
     const v: VesselTrack = object.vessel;
-    const ww = v.whaleWatch ? `<br/>Whale watch · ${v.whaleWatch.operator}` : "";
+    const ww = v.whaleWatch ? `<br/>Whale watch · ${v.whaleWatch.operator}${v.whaleWatch.confirmed ? "" : " (unconfirmed: name match only)"}` : "";
     const head = `<b>${v.name || "(no name)"}</b>${ww}<br/>MMSI ${v.mmsi} · Class ${v.cls} · ${shipTypeLabel(v.shipType)}${v.lengthM ? ` · ${v.lengthM} m` : ""}`;
     if (layer?.id === "fixes") {
       const f = object as FixDatum;
@@ -293,6 +318,34 @@ export default function BoatMap() {
         style={{ width: "100%", height: "100%" }}
         onLoad={(e) => attachDeck(e.target)}
       >
+        {basemap === "depth" && (
+          <>
+            <Source id="depth-areas" type="geojson" data="/depth/areas.geojson" attribution="Depths: NOAA ENC · not for navigation">
+              <Layer id="depth-areas" type="fill" beforeId={DEPTH_BEFORE} paint={{ "fill-color": DEPTH_FILL, "fill-antialias": false }} />
+            </Source>
+            <Source id="depth-contours" type="geojson" data="/depth/contours.geojson">
+              <Layer
+                id="depth-contours"
+                type="line"
+                beforeId={DEPTH_BEFORE}
+                paint={{ "line-color": "#5f86a8", "line-opacity": 0.45, "line-width": ["interpolate", ["linear"], ["zoom"], 8, 0.4, 13, 1] }}
+              />
+              <Layer
+                id="depth-contour-labels"
+                type="symbol"
+                minzoom={11}
+                layout={{
+                  "symbol-placement": "line",
+                  "text-field": ["concat", ["to-string", ["round", ["get", "VALDCO"]]], " m"],
+                  "text-font": ["Noto Sans Regular"],
+                  "text-size": 10,
+                  "symbol-spacing": 350,
+                }}
+                paint={{ "text-color": "#41637f", "text-halo-color": "#e6f1f8", "text-halo-width": 1.2 }}
+              />
+            </Source>
+          </>
+        )}
         {noaa && (
           <Source id="noaa-chart" type="raster" tiles={[NOAA_WMS]} tileSize={256} attribution="Charts: NOAA Office of Coast Survey">
             <Layer id="noaa-chart" type="raster" paint={{ "raster-opacity": 0.9 }} />
@@ -348,6 +401,9 @@ export default function BoatMap() {
                     load(e.target.value);
                   }}
                 >
+                  <option value={WINDOW_ID} className="text-black">
+                    Last 48 h · all samples
+                  </option>
                   {samples.map((s) => (
                     <option key={s.file} value={s.file} className="text-black">
                       {s.file.replace(/^ais-/, "").replace(/\.jsonl$/, "")} ({Math.round(s.bytes / 1024)} KB)
@@ -357,7 +413,7 @@ export default function BoatMap() {
                 <button
                   className="rounded-lg border border-current/20 px-2.5"
                   onClick={() => file && load(file)}
-                  title="Reload (picks up new messages if the sample is still recording)"
+                  title="Reload (picks up new samples, and new messages in ones still recording)"
                 >
                   ↻
                 </button>
@@ -369,6 +425,8 @@ export default function BoatMap() {
             {data && (
               <p className={secondary}>
                 {data.start && data.end ? `${fmtDate(data.start)} – ${fmtTime(data.end)}` : "No positions"} ·{" "}
+                {data.file === WINDOW_ID &&
+                  (data.source === "supabase" ? "Supabase · " : `${data.files.length} sample${data.files.length === 1 ? "" : "s"} · `)}
                 {data.positionReports} fixes · {data.vessels.length} vessels · {movingCount} moving
               </p>
             )}
@@ -408,6 +466,7 @@ export default function BoatMap() {
             </div>
 
             <Legend mode={colorMode} theme={theme} secondary={secondary} />
+            {basemap === "depth" && <DepthLegend secondary={secondary} />}
 
             {whaleOnly ? (
               <WhaleWatchRoster vessels={vessels} selected={selected} onFocus={focusVessel} theme={theme} secondary={secondary} />
@@ -438,7 +497,7 @@ export default function BoatMap() {
                             <span className="truncate">{v.name || v.mmsi}</span>
                             {v.whaleWatch && (
                               <span className="shrink-0 rounded-full border border-current/30 px-1.5 text-xs" title={v.whaleWatch.operator}>
-                                whale watch
+                                {v.whaleWatch.confirmed ? "whale watch" : "whale watch?"}
                               </span>
                             )}
                             {v.moving && <span className={`text-xs ${secondary}`}>moving</span>}
@@ -512,6 +571,11 @@ function WhaleWatchRoster({
                     aria-label={`Class ${v.cls}`}
                   />
                   <span className="truncate font-medium">{rv.name}</span>
+                  {!v.whaleWatch?.confirmed && (
+                    <span className={`text-xs ${secondary}`} title="Matched on a common name; AIS doesn't report it as a passenger vessel">
+                      unconfirmed
+                    </span>
+                  )}
                   {v.moving && <span className={`text-xs ${secondary}`}>moving</span>}
                 </span>
                 <span className={`shrink-0 text-xs ${secondary}`}>
@@ -575,6 +639,27 @@ function Tab({
     >
       {children}
     </button>
+  );
+}
+
+function DepthLegend({ secondary }: { secondary: string }) {
+  return (
+    <div className="flex flex-col gap-1 text-xs">
+      <div className="flex">
+        {DEPTH_BANDS.map((b) => (
+          <span key={b.label} className="h-2.5 flex-1 first:rounded-l last:rounded-r" style={{ background: b.color }} title={b.label} />
+        ))}
+      </div>
+      {/* One label per swatch: the depth where that band starts. */}
+      <div className={`flex ${secondary}`}>
+        {["flat", "0", "5", "18", "37", "91", "183 m"].map((l) => (
+          <span key={l} className="flex-1">
+            {l}
+          </span>
+        ))}
+      </div>
+      <span className={secondary}>Water depth from NOAA charts · not for navigation</span>
+    </div>
   );
 }
 

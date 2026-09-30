@@ -1,9 +1,12 @@
 // Sample AIS traffic from AISStream for a bounding box and summarize it.
 //
-//   node scripts/ais-sample.ts [--minutes 10] [--region island-county]
+//   node scripts/ais-sample.ts [--minutes 10] [--region puget-sound] [--rows 80] [--no-db]
 //
 // Reads AISSTREAM_API_KEY from .env.local. Writes every raw message to
 // data/samples/ais-<region>-<timestamp>.jsonl and prints a per-vessel summary.
+// With SUPABASE_URL and SUPABASE_SECRET_KEY set, positions and vessel details
+// are also written to Supabase every few seconds
+// (db/migrations/*_ais_positions.sql). --no-db skips Supabase for test runs.
 // Box-wide on purpose: there is no registry yet, so this also shows which
 // vessels would be registry candidates (spec §4.3).
 
@@ -13,6 +16,11 @@ import { join } from "node:path";
 type BBox = [[number, number], [number, number]]; // [[lat, lon] SW, [lat, lon] NE]
 
 const REGIONS: Record<string, { name: string; bbox: BBox }> = {
+  // Tacoma Narrows / Vashon Island north to Orcas and Lummi islands, from the
+  // Seattle–Everett shoreline west to Orcas and the north end of Hood Canal:
+  // central and south Sound, Admiralty Inlet, Whidbey/Camano, Skagit Bay,
+  // Rosario Strait, Bellingham Bay and the eastern San Juans.
+  "puget-sound": { name: "Puget Sound (Tacoma/Vashon – Orcas/Lummi)", bbox: [[47.22, -123.1], [48.78, -122.15]] },
   // Whidbey + Camano islands with the surrounding water: Saratoga Passage,
   // Port Susan, Skagit Bay, Possession Sound (west half), east Admiralty Inlet.
   "island-county": { name: "Island County (Whidbey + Camano)", bbox: [[47.88, -122.8], [48.42, -122.3]] },
@@ -36,20 +44,28 @@ function arg(name: string, fallback: string): string {
   return i > -1 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
 }
 
-function loadKey(): string {
-  if (process.env.AISSTREAM_API_KEY) return process.env.AISSTREAM_API_KEY;
+function envVar(name: string): string | undefined {
+  if (process.env[name]) return process.env[name];
   try {
     for (const line of readFileSync(".env.local", "utf8").split("\n")) {
-      const m = line.match(/^\s*AISSTREAM_API_KEY\s*=\s*"?([^"\s]+)"?/);
+      const m = line.match(new RegExp(`^\\s*${name}\\s*=\\s*"?([^"\\s]+)"?`));
       if (m) return m[1];
     }
   } catch {}
+  return undefined;
+}
+
+function loadKey(): string {
+  const key = envVar("AISSTREAM_API_KEY");
+  if (key) return key;
   console.error("Missing AISSTREAM_API_KEY. Add it to .env.local (get one at https://aisstream.io/apikeys).");
   process.exit(1);
 }
 
 const minutes = Number(arg("minutes", "10"));
-const regionId = arg("region", "island-county");
+// Large regions see hundreds of vessels; cap the printed tables (the raw file keeps everything).
+const TABLE_ROWS = Number(arg("rows", "80"));
+const regionId = arg("region", "puget-sound");
 const region = REGIONS[regionId];
 if (!region) {
   console.error(`Unknown region "${regionId}". Options: ${Object.keys(REGIONS).join(", ")}`);
@@ -89,6 +105,56 @@ function dimLength(d: any): number | undefined {
   return len > 0 ? len : undefined;
 }
 
+// --- Supabase ---------------------------------------------------------------
+
+const USE_DB = !process.argv.includes("--no-db");
+const SUPABASE_URL = USE_DB ? envVar("SUPABASE_URL") : undefined;
+const SUPABASE_KEY = USE_DB ? envVar("SUPABASE_SECRET_KEY") : undefined;
+const FLUSH_MS = 5_000;
+
+type PositionRow = { mmsi: number; t: number; lon: number; lat: number; sog: number | null; cog: number | null };
+let pendingPositions: PositionRow[] = [];
+const dirtyVessels = new Set<number>();
+let stored = 0;
+let storeErrors = 0;
+
+// "2026-09-29 14:51:42.593229588 +0000 UTC" -> epoch seconds
+function parseAisTime(s: unknown): number | null {
+  if (typeof s !== "string") return null;
+  const m = s.match(/^(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d)(\.\d+)?/);
+  if (!m) return null;
+  const ms = Date.parse(`${m[1]}T${m[2]}${(m[3] ?? "").slice(0, 4)}Z`);
+  return Number.isNaN(ms) ? null : ms / 1000;
+}
+
+async function flush() {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return;
+  const positions = pendingPositions;
+  const mmsis = [...dirtyVessels];
+  if (!positions.length && !mmsis.length) return;
+  pendingPositions = [];
+  dirtyVessels.clear();
+  const vesselRows = mmsis.map((mmsi) => {
+    const v = vessels.get(mmsi)!;
+    return { mmsi, name: v.name ?? null, cls: v.cls ?? null, ship_type: v.shipType ?? null, length_m: v.lengthM ?? null };
+  });
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/ingest_ais`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, "content-type": "application/json" },
+      body: JSON.stringify({ p_positions: positions, p_vessels: vesselRows }),
+    });
+    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+    stored += positions.length;
+  } catch (err) {
+    // Keep the batch for the next attempt; the raw .jsonl file has everything regardless.
+    storeErrors++;
+    pendingPositions = positions.concat(pendingPositions);
+    for (const m of mmsis) dirtyVessels.add(m);
+    if (storeErrors <= 3) console.error("Supabase write failed:", String(err).slice(0, 300));
+  }
+}
+
 function handle(msg: any, now: number) {
   const type: string = msg.MessageType;
   typeCounts[type] = (typeCounts[type] ?? 0) + 1;
@@ -96,6 +162,7 @@ function handle(msg: any, now: number) {
   const mmsi: number = meta.MMSI;
   if (!mmsi) return;
   const v = vessel(mmsi);
+  dirtyVessels.add(mmsi);
   const shipName = typeof meta.ShipName === "string" ? meta.ShipName.trim() : "";
   if (shipName && !v.name) v.name = shipName;
   const body = msg.Message?.[type] ?? {};
@@ -112,6 +179,16 @@ function handle(msg: any, now: number) {
     v.lastLat = meta.latitude;
     v.lastLon = meta.longitude;
     if (typeof meta.latitude === "number") recordCoverage(meta.latitude, meta.longitude, mmsi, body.Sog);
+    if (typeof meta.latitude === "number" && typeof meta.longitude === "number") {
+      pendingPositions.push({
+        mmsi,
+        t: parseAisTime(meta.time_utc) ?? now / 1000,
+        lon: meta.longitude,
+        lat: meta.latitude,
+        sog: typeof body.Sog === "number" && body.Sog < 102.3 ? body.Sog : null,
+        cog: typeof body.Cog === "number" && body.Cog < 360 ? body.Cog : null,
+      });
+    }
     if (type === "ExtendedClassBPositionReport") {
       v.shipType ??= body.Type;
       v.lengthM ??= dimLength(body.Dimension);
@@ -165,7 +242,8 @@ function summarize(outPath: string) {
       candidate: candidate ? "★" : "",
     };
   });
-  console.table(rows);
+  console.table(rows.slice(0, TABLE_ROWS));
+  if (rows.length > TABLE_ROWS) console.log(`(showing the ${TABLE_ROWS} vessels with the most fixes of ${rows.length}; all are in the raw file)`);
   const a = list.filter((v) => v.cls === "A").length;
   const b = list.filter((v) => v.cls === "B").length;
   console.log(`Class A: ${a} · Class B: ${b} · ★ = passenger type, 15–35 m (registry candidate, spec §4.3)`);
@@ -190,7 +268,8 @@ function summarizeCoverage() {
   const [[s, w], [n, e]] = region.bbox;
   const totalCells = Math.ceil((n - s) / 0.05) * Math.ceil((e - w) / 0.05);
   console.log(`\nCoverage: position reports in ${cells.length} of ~${totalCells} cells (0.05° ≈ 5 km, SW corner shown)`);
-  console.table(cells.map(([cell, c]) => ({ cell, msgs: c.msgs, vessels: c.mmsis.size, moving: c.moving.size })));
+  console.table(cells.slice(0, TABLE_ROWS).map(([cell, c]) => ({ cell, msgs: c.msgs, vessels: c.mmsis.size, moving: c.moving.size })));
+  if (cells.length > TABLE_ROWS) console.log(`(showing the ${TABLE_ROWS} busiest cells of ${cells.length})`);
 }
 
 const key = loadKey();
@@ -201,6 +280,8 @@ const out = createWriteStream(outPath);
 const decoder = new TextDecoder();
 
 console.log(`Sampling ${region.name} for ${minutes} min → ${outPath}`);
+console.log(SUPABASE_URL && SUPABASE_KEY ? "Also writing to Supabase." : "Supabase not configured; writing the local file only.");
+const flusher = setInterval(flush, FLUSH_MS);
 const ws = new WebSocket("wss://stream.aisstream.io/v0/stream");
 ws.binaryType = "arraybuffer";
 
@@ -209,9 +290,14 @@ function finish(code = 0) {
   if (finished) return;
   finished = true;
   clearInterval(progress);
+  clearInterval(flusher);
   try { ws.close(); } catch {}
-  out.end(() => {
+  out.end(async () => {
+    await flush();
     summarize(outPath);
+    if (SUPABASE_URL && SUPABASE_KEY) {
+      console.log(`Supabase: ${stored} positions stored${pendingPositions.length ? `, ${pendingPositions.length} not written` : ""}${storeErrors ? ` · ${storeErrors} failed writes` : ""}`);
+    }
     process.exit(code);
   });
 }

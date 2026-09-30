@@ -3,8 +3,10 @@
 // matched on their broadcast AIS name. Add an MMSI to `mmsis` once a boat is
 // confirmed in a sample; an MMSI match beats any name match.
 //
-// Names like SARATOGA or WAKE are shared with private boats, so `generic`
-// vessels only match when AIS also reports a passenger ship type (60–69).
+// Names like SARATOGA or WAKE are shared with private boats, so a `generic`
+// name is only a confirmed match when AIS also reports a passenger ship type
+// (60–69). Small tour boats often report "pleasure craft" or no type at all,
+// so other generic-name hits are kept but flagged `confirmed: false`.
 
 export type WhaleWatchVessel = {
   name: string;
@@ -77,7 +79,7 @@ export const OPERATORS: WhaleWatchOperator[] = [
   },
 ];
 
-export type WhaleWatchMatch = { operatorId: string; operator: string; vessel: string; by: "mmsi" | "name" };
+export type WhaleWatchMatch = { operatorId: string; operator: string; vessel: string; by: "mmsi" | "name"; confirmed: boolean };
 
 const ROMAN: Record<string, string> = { I: "1", II: "2", III: "3", IV: "4", V: "5", VI: "6", VII: "7", VIII: "8", IX: "9", X: "10" };
 
@@ -109,15 +111,16 @@ for (const operator of OPERATORS) {
 const isPassenger = (t: number | null) => t != null && t >= 60 && t <= 69;
 
 export function matchWhaleWatch(mmsi: number, name: string, shipType: number | null): WhaleWatchMatch | null {
-  const hit = (e: Entry, by: WhaleWatchMatch["by"]): WhaleWatchMatch => ({
+  const hit = (e: Entry, by: WhaleWatchMatch["by"], confirmed: boolean): WhaleWatchMatch => ({
     operatorId: e.operator.id,
     operator: e.operator.name,
     vessel: e.vessel.name,
     by,
+    confirmed,
   });
   const m = byMmsi.get(mmsi);
-  if (m) return hit(m, "mmsi");
+  if (m) return hit(m, "mmsi", true);
   const e = name ? byName.get(normalizeName(name)) : undefined;
-  if (!e || (e.vessel.generic && !isPassenger(shipType))) return null;
-  return hit(e, "name");
+  if (!e) return null;
+  return hit(e, "name", !e.vessel.generic || isPassenger(shipType));
 }

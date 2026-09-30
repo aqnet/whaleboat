@@ -1,0 +1,7 @@
+# `gcloud run deploy --source web` uploads this directory. Without this file it
+# would fall back to .gitignore and leave out public/depth/, which is
+# gitignored but needed in the image (run `npm run depth:fetch` first).
+node_modules/
+.next/
+.env*
+tsconfig.tsbuildinfo

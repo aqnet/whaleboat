@@ -4,9 +4,9 @@
 // per day from Mar 23 to Oct 31, and the value lives in the cell's background
 // class (navy = seen, gray = no tours, white = toured without a sighting).
 //
-// Fetched on demand, kept in memory for CACHE_MS, and saved to
-// data/sightings/ so the app still has the last good copy if the page is down
-// or a past season is taken off it.
+// Fetched on demand, kept in memory for CACHE_MS, and saved (to Supabase, or
+// data/sightings/ in local dev) so the app still has the last good copy if
+// the page is down or a past season is taken off it.
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -116,6 +116,39 @@ export function parseSightingsPage(html: string): SightingSeason[] {
   return seasons.sort((a, b) => b.year - a.year);
 }
 
+// The last good copy lives in Supabase (db/migrations/*_sighting_logs.sql)
+// when it's configured: Cloud Run containers have no durable disk. Without
+// Supabase (local dev) it is a file under data/sightings/.
+const supabase = () =>
+  process.env.SUPABASE_URL && process.env.SUPABASE_SECRET_KEY
+    ? { url: `${process.env.SUPABASE_URL}/rest/v1/sighting_logs`, key: process.env.SUPABASE_SECRET_KEY }
+    : null;
+
+async function saveSnapshot(log: SightingLog): Promise<void> {
+  const db = supabase();
+  if (!db) {
+    await mkdir(join(SNAPSHOT, ".."), { recursive: true });
+    await writeFile(SNAPSHOT, JSON.stringify(log));
+    return;
+  }
+  const res = await fetch(`${db.url}?on_conflict=operator_id`, {
+    method: "POST",
+    headers: { apikey: db.key, "content-type": "application/json", prefer: "resolution=merge-duplicates" },
+    body: JSON.stringify({ operator_id: log.operatorId, source: log.source, fetched_at: log.fetchedAt, seasons: log.seasons }),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 200)}`);
+}
+
+async function readSnapshot(): Promise<SightingLog> {
+  const db = supabase();
+  if (!db) return JSON.parse(await readFile(SNAPSHOT, "utf8"));
+  const res = await fetch(`${db.url}?operator_id=eq.${SIGHTINGS_OPERATOR_ID}&select=*`, { headers: { apikey: db.key }, cache: "no-store" });
+  if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 200)}`);
+  const [row] = await res.json();
+  if (!row) throw new Error("no saved sighting log");
+  return { operatorId: row.operator_id, source: row.source, fetchedAt: row.fetched_at, stale: true, seasons: row.seasons };
+}
+
 let cached: { at: number; log: SightingLog } | null = null;
 
 export async function loadSightings(): Promise<SightingLog> {
@@ -132,13 +165,13 @@ export async function loadSightings(): Promise<SightingLog> {
       stale: false,
       seasons,
     };
-    await mkdir(join(SNAPSHOT, ".."), { recursive: true });
-    await writeFile(SNAPSHOT, JSON.stringify(log));
+    // Best effort: a failed save must not fail a good fetch.
+    await saveSnapshot(log).catch((err) => console.warn(`sightings: snapshot not saved (${String(err)})`));
     cached = { at: Date.now(), log };
     return log;
   } catch (err) {
     console.warn(`sightings: fetch failed (${String(err)}); using snapshot`);
-    const log: SightingLog = { ...JSON.parse(await readFile(SNAPSHOT, "utf8")), stale: true };
+    const log: SightingLog = { ...(await readSnapshot()), stale: true };
     // Retry the live page after a short pause rather than on every request.
     cached = { at: Date.now() - CACHE_MS + 10 * 60 * 1000, log };
     return log;

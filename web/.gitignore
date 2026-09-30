@@ -42,3 +42,6 @@ next-env.d.ts
 
 # copied from node_modules by scripts/copy-maplibre-worker.mjs
 /public/maplibre/
+
+# downloaded by `npm run depth:fetch` in the repo root (NOAA ENC Direct)
+/public/depth/
