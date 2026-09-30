@@ -106,7 +106,6 @@ const MAX_DECK_RETRIES = 5;
 type FixDatum = Fix & { vessel: VesselTrack };
 type PathDatum = { vessel: VesselTrack; path: [number, number][]; sogs: (number | null)[] };
 
-const fmtTime = (t: number) => new Date(t * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 const fmtDate = (t: number) => new Date(t * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 
 function shipTypeLabel(t: number | null): string {
@@ -127,11 +126,16 @@ export default function BoatMap() {
   const [file, setFile] = useState<string | null>(WINDOW_ID);
   const [data, setData] = useState<SampleSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [basemap, setBasemap] = useState<BasemapId>("light");
+  const [basemap, setBasemap] = useState<BasemapId>("streets");
   const [noaa, setNoaa] = useState(false);
+  // True once the loaded base style contains the layer the depth layers sit
+  // under. Switching basemaps swaps styles asynchronously, so for a moment
+  // the old style is still the one on the map.
+  const [depthAnchorReady, setDepthAnchorReady] = useState(false);
   const [colorMode, setColorMode] = useState<ColorMode>("class");
   const [movingOnly, setMovingOnly] = useState(false);
-  const [whaleOnly, setWhaleOnly] = useState(false);
+  // The map opens on the whale-watch fleet; the chip turns it off to show all traffic.
+  const [whaleOnly, setWhaleOnly] = useState(true);
   const [tab, setTab] = useState<PanelTab>("ais");
   const [selected, setSelected] = useState<number | null>(null);
   const [panelOpen, setPanelOpen] = useState(true);
@@ -144,24 +148,30 @@ export default function BoatMap() {
     load(WINDOW_ID);
   }, []);
 
-  // The window view also re-lists samples, so a pull started after the page
-  // loaded shows up on the next reload.
+  // Messages shown to people using the map. Details go to the console only.
+  const NO_DATA = "No data samples available. Please refresh.";
+  const LOAD_FAILED = "Couldn't load boat data. Please refresh.";
+
+  // Local sample files only exist in development, where they fill the picker.
+  // In production the list is empty and the map reads from the database, so
+  // an empty list is not an error. Re-listing on each load picks up a pull
+  // started after the page opened.
   function load(f: string) {
     fetch("/api/samples")
       .then((r) => r.json())
-      .then((list: SampleFile[]) => {
-        setSamples(list);
-        if (!list.length) setError("No samples yet. Run `npm run ais:sample` in the repo root.");
-      })
-      .catch((e) => setError(String(e)));
+      .then((list: SampleFile[]) => setSamples(Array.isArray(list) ? list : []))
+      .catch(() => setSamples([]));
     fetch(f === WINDOW_ID ? "/api/tracks" : `/api/tracks?file=${encodeURIComponent(f)}`)
       .then(async (r) => {
         const body = await r.json();
         if (!r.ok) throw new Error(body.error ?? r.statusText);
-        setError(null);
         setData(body);
+        setError(body.positionReports ? null : NO_DATA);
       })
-      .catch((e) => setError(String(e.message ?? e)));
+      .catch((e) => {
+        console.error("tracks:", e);
+        setError(LOAD_FAILED);
+      });
   }
 
   const vessels = useMemo(
@@ -230,7 +240,7 @@ export default function BoatMap() {
   const getTooltip = ({ object, layer }: PickingInfo) => {
     if (!object) return null;
     const v: VesselTrack = object.vessel;
-    const ww = v.whaleWatch ? `<br/>Whale watch · ${v.whaleWatch.operator}${v.whaleWatch.confirmed ? "" : " (unconfirmed: name match only)"}` : "";
+    const ww = v.whaleWatch ? `<br/>Whale watch · ${v.whaleWatch.operator}${v.whaleWatch.confirmed ? "" : " (unconfirmed)"}` : "";
     const head = `<b>${v.name || "(no name)"}</b>${ww}<br/>MMSI ${v.mmsi} · Class ${v.cls} · ${shipTypeLabel(v.shipType)}${v.lengthM ? ` · ${v.lengthM} m` : ""}`;
     if (layer?.id === "fixes") {
       const f = object as FixDatum;
@@ -302,7 +312,8 @@ export default function BoatMap() {
   };
 
   // Sighting logs are kept by local calendar day.
-  const sampleDate = data?.start ? new Date(data.start * 1000).toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" }) : null;
+  // The newest day on the map, in local (Pacific) time: sighting logs are kept by day.
+  const sampleDate = data?.end ? new Date(data.end * 1000).toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" }) : null;
 
   const movingCount = data?.vessels.filter((v) => v.moving).length ?? 0;
   const ink = theme === "dark" ? "text-white" : "text-[#0b0b0b]";
@@ -317,8 +328,9 @@ export default function BoatMap() {
         mapStyle={BASEMAPS[basemap].url}
         style={{ width: "100%", height: "100%" }}
         onLoad={(e) => attachDeck(e.target)}
+        onStyleData={(e) => setDepthAnchorReady(Boolean(e.target.getLayer(DEPTH_BEFORE)))}
       >
-        {basemap === "depth" && (
+        {basemap === "depth" && depthAnchorReady && (
           <>
             <Source id="depth-areas" type="geojson" data="/depth/areas.geojson" attribution="Depths: NOAA ENC · not for navigation">
               <Layer id="depth-areas" type="fill" beforeId={DEPTH_BEFORE} paint={{ "fill-color": DEPTH_FILL, "fill-antialias": false }} />
@@ -389,6 +401,7 @@ export default function BoatMap() {
 
         {panelOpen && tab === "ais" && (
           <div role="tabpanel" id="panel-ais" aria-labelledby="tab-ais" className="flex min-h-0 flex-col gap-3 overflow-hidden px-4 pb-4 pt-3 text-sm">
+            {samples.length > 0 ? (
             <label className="flex flex-col gap-1">
               <span className={secondary}>Sample</span>
               <div className="flex gap-2">
@@ -402,7 +415,7 @@ export default function BoatMap() {
                   }}
                 >
                   <option value={WINDOW_ID} className="text-black">
-                    Last 48 h · all samples
+                    Last 48 hours
                   </option>
                   {samples.map((s) => (
                     <option key={s.file} value={s.file} className="text-black">
@@ -413,21 +426,33 @@ export default function BoatMap() {
                 <button
                   className="rounded-lg border border-current/20 px-2.5"
                   onClick={() => file && load(file)}
-                  title="Reload (picks up new samples, and new messages in ones still recording)"
+                  title="Refresh"
+                  aria-label="Refresh"
                 >
                   ↻
                 </button>
               </div>
             </label>
+            ) : (
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium">Last 48 hours</span>
+                <button
+                  className="rounded-lg border border-current/20 px-2.5 py-1"
+                  onClick={() => load(WINDOW_ID)}
+                  title="Refresh"
+                  aria-label="Refresh"
+                >
+                  ↻
+                </button>
+              </div>
+            )}
 
             {error && <p className="rounded-lg bg-[#d03b3b]/15 px-3 py-2">⚠ {error}</p>}
 
-            {data && (
+            {data && data.positionReports > 0 && (
               <p className={secondary}>
-                {data.start && data.end ? `${fmtDate(data.start)} – ${fmtTime(data.end)}` : "No positions"} ·{" "}
-                {data.file === WINDOW_ID &&
-                  (data.source === "supabase" ? "Supabase · " : `${data.files.length} sample${data.files.length === 1 ? "" : "s"} · `)}
-                {data.positionReports} fixes · {data.vessels.length} vessels · {movingCount} moving
+                {data.start && data.end ? `${fmtDate(data.start)} – ${fmtDate(data.end)} · ` : ""}
+                {data.positionReports.toLocaleString()} positions · {data.vessels.length.toLocaleString()} vessels · {movingCount} moving
               </p>
             )}
 
@@ -542,9 +567,13 @@ function WhaleWatchRoster({
     <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden rounded-lg border border-current/10">
       {OPERATORS.map((op) => (
         <div key={op.id} className="border-t border-current/5 first:border-t-0">
-          <a href={op.url} target="_blank" rel="noreferrer" className={`block px-2 pb-0.5 pt-2 text-xs hover:underline ${secondary}`}>
-            {op.name}
-          </a>
+          {op.url ? (
+            <a href={op.url} target="_blank" rel="noreferrer" className={`block px-2 pb-0.5 pt-2 text-xs hover:underline ${secondary}`}>
+              {op.name}
+            </a>
+          ) : (
+            <span className={`block px-2 pb-0.5 pt-2 text-xs ${secondary}`}>{op.name}</span>
+          )}
           {op.vessels.map((rv) => {
             const seen = vessels.filter((v) => v.whaleWatch?.operatorId === op.id && v.whaleWatch.vessel === rv.name);
             if (!seen.length) {
@@ -572,7 +601,7 @@ function WhaleWatchRoster({
                   />
                   <span className="truncate font-medium">{rv.name}</span>
                   {!v.whaleWatch?.confirmed && (
-                    <span className={`text-xs ${secondary}`} title="Matched on a common name; AIS doesn't report it as a passenger vessel">
+                    <span className={`text-xs ${secondary}`} title="Matched by name only; this may be a different boat">
                       unconfirmed
                     </span>
                   )}

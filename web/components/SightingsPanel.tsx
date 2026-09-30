@@ -58,7 +58,10 @@ export default function SightingsPanel({
         if (!r.ok) throw new Error(body.error ?? r.statusText);
         setLog(body);
       })
-      .catch((e) => setError(String(e.message ?? e)));
+      .catch((e) => {
+        console.error("sightings:", e);
+        setError("Sighting reports aren't available right now. Please refresh.");
+      });
   }, []);
 
   const sampleYear = sampleDate ? Number(sampleDate.slice(0, 4)) : null;
@@ -66,7 +69,7 @@ export default function SightingsPanel({
   const grid = useMemo(() => season?.species.map((sp) => ({ species: sp, months: monthly(season, sp) })) ?? [], [season]);
 
   if (error) return <p className="rounded-lg bg-[#d03b3b]/15 px-3 py-2">⚠ {error}</p>;
-  if (!log || !season) return <p className={secondary}>Loading sighting log…</p>;
+  if (!log || !season) return <p className={secondary}>Loading sighting reports…</p>;
 
   const tourDays = season.days.filter((d) => d.toured).length;
   const orcaDays = season.days.filter((d) => d.toured && d.seen.includes("Orca")).length;
@@ -80,12 +83,12 @@ export default function SightingsPanel({
         <a href={log.source} target="_blank" rel="noreferrer" className="underline">
           Western Prince
         </a>{" "}
-        (Friday Harbor){log.stale && " · offline copy"}
+        (Friday Harbor){log.stale && " · may be out of date"}
       </p>
 
       {sampleDate && (
         <div className="rounded-lg border border-current/10 px-3 py-2">
-          <div className={`text-xs ${secondary}`}>Sample day · {fmtDay(sampleDate)}</div>
+          <div className={`text-xs ${secondary}`}>Latest day on the map · {fmtDay(sampleDate)}</div>
           {!sampleDay ? (
             <div>Not reported yet</div>
           ) : !sampleDay.toured ? (
