@@ -18,6 +18,8 @@
 //   PORT       if set (Cloud Run *service*), serves a health check on it
 //   AISSTREAM_URL   override the stream endpoint (tests)
 //   ACARTIA_URL     override the whale sightings feed (tests); "off" disables it
+//   ACARTIA_POLL_MS override the 15-minute poll interval (tests)
+//   SECRET_WAIT_MS  how long to wait for a *_FILE to become readable (default 60 s)
 //
 // No dependencies: Node >= 22.18 runs this file directly and has WebSocket
 // and fetch built in. Logs are JSON lines, which Cloud Logging parses.
@@ -48,7 +50,7 @@ const BACKOFF_MAX_MS = 60_000;
 // Bounds memory if Supabase is unreachable: oldest positions are dropped first.
 const MAX_PENDING = 50_000;
 // The feed keeps ~7 days, so a missed poll or two loses nothing.
-const WHALES_MS = 15 * 60_000;
+const WHALES_MS = Number(process.env.ACARTIA_POLL_MS) || 15 * 60_000;
 
 function log(severity: "INFO" | "WARNING" | "ERROR", message: string, extra: Record<string, unknown> = {}) {
   console.log(JSON.stringify({ severity, message, ...extra, time: new Date().toISOString() }));
@@ -57,9 +59,33 @@ function log(severity: "INFO" | "WARNING" | "ERROR", message: string, extra: Rec
 // NAME_FILE (a path) takes precedence over NAME, so a host can hand secrets
 // over as files in memory rather than as container environment variables,
 // which Docker writes to disk.
-function required(name: string): string {
+//
+// On the VM, Docker restarts the old container at boot while the startup
+// script is still writing those files (they live in /run, which is empty
+// after a reboot). So a missing or unreadable file is waited for, briefly,
+// rather than crashing on it.
+async function required(name: string): Promise<string> {
   const file = process.env[`${name}_FILE`];
-  const v = file ? readFileSync(file, "utf8").trim() : process.env[name];
+  let v = process.env[name];
+  if (file) {
+    const deadline = Date.now() + (Number(process.env.SECRET_WAIT_MS) || 60_000);
+    let warned = false;
+    for (;;) {
+      try {
+        v = readFileSync(file, "utf8").trim();
+        break;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if ((code !== "ENOENT" && code !== "EACCES") || Date.now() > deadline) {
+          log("ERROR", `Cannot read ${name}_FILE`, { file, error: String(err) });
+          process.exit(1);
+        }
+        if (!warned) log("WARNING", `Waiting for ${name}_FILE to become readable`, { file, code });
+        warned = true;
+        await new Promise((r) => setTimeout(r, 1_000));
+      }
+    }
+  }
   if (!v) {
     log("ERROR", `Missing environment variable ${name}`);
     process.exit(1);
@@ -77,9 +103,9 @@ function parseBBox(s: string | undefined): BBox {
   return [[south, west], [north, east]];
 }
 
-const AIS_KEY = required("AISSTREAM_API_KEY");
-const SUPABASE_URL = required("SUPABASE_URL");
-const SUPABASE_KEY = required("SUPABASE_SECRET_KEY");
+const AIS_KEY = await required("AISSTREAM_API_KEY");
+const SUPABASE_URL = await required("SUPABASE_URL");
+const SUPABASE_KEY = await required("SUPABASE_SECRET_KEY");
 const BBOX = parseBBox(process.env.AIS_BBOX);
 const ACARTIA_URL = process.env.ACARTIA_URL ?? "https://acartia.io/api/v1/sightings/current";
 
@@ -241,13 +267,18 @@ function whaleRow(r: any) {
   };
 }
 
+// What was last stored for each report in the feed, so a poll only sends
+// reports that are new or have changed (each poll sees the whole week).
+let whalesSent = new Map<string, string>();
+
 async function pollWhales() {
   try {
     const feed = await fetch(ACARTIA_URL, { headers: { "user-agent": "whaleboat-recorder/0.1" }, signal: AbortSignal.timeout(30_000) });
     if (!feed.ok) throw new Error(`Acartia ${feed.status} ${feed.statusText}`);
     const body = await feed.json();
     if (!Array.isArray(body)) throw new Error("Acartia: unexpected response shape");
-    const rows = body.map(whaleRow).filter((r) => r != null);
+    const all = body.map(whaleRow).filter((r) => r != null);
+    const rows = all.filter((r) => whalesSent.get(r.id) !== JSON.stringify(r));
     if (rows.length) {
       const res = await fetch(`${SUPABASE_URL}/rest/v1/whale_sightings?on_conflict=id`, {
         method: "POST",
@@ -257,8 +288,10 @@ async function pollWhales() {
       });
       if (!res.ok) throw new Error(`Supabase ${res.status} ${(await res.text()).slice(0, 300)}`);
     }
-    stats.whaleSightings = rows.length;
-    log("INFO", "Whale sightings stored", { count: rows.length });
+    // Forget reports that have aged out of the feed.
+    whalesSent = new Map(all.map((r) => [r.id, JSON.stringify(r)]));
+    stats.whaleSightings += rows.length;
+    if (rows.length) log("INFO", "Whale sightings stored", { count: rows.length, in_feed: all.length });
   } catch (err) {
     stats.whaleErrors++;
     log("WARNING", "Whale sightings poll failed", { error: String(err) });

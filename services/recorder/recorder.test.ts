@@ -38,6 +38,7 @@ class Stub {
   subscriptions: Record<string, unknown>[] = [];
   batches: Batch[] = [];
   failNextWrites = 0;
+  acartiaPolls = 0;
   whaleUpserts: { url: string | undefined; prefer: string | undefined; rows: Record<string, unknown>[] }[] = [];
 
   constructor() {
@@ -59,6 +60,7 @@ class Stub {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
+      if (req.url === "/acartia") this.acartiaPolls++;
       if (req.url === "/acartia") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(ACARTIA_ROWS));
       if (req.url?.startsWith("/rest/v1/whale_sightings")) {
         this.whaleUpserts.push({ url: req.url, prefer: req.headers.prefer as string | undefined, rows: JSON.parse(body) });
@@ -122,7 +124,7 @@ const staticData = (mmsi: number, name: string, type: number) => ({
 });
 
 // Shaped like https://acartia.io/api/v1/sightings/current.
-const ACARTIA_ROWS = [
+const ACARTIA_ROWS: Record<string, unknown>[] = [
   { entry_id: "gray-1", created: "2026-09-30 18:50:00", type: "Gray Whale", no_sighted: 1, latitude: "48.02052", longitude: "-122.29249", trusted: 1, data_source_comments: "[Orca Network] Gray CRC53 milling ", photo_url: "" },
   { entry_id: "monterey", created: "2026-09-30 18:00:00", type: "Humpback", no_sighted: 3, latitude: 36.79, longitude: -121.9, trusted: 0 },
   { entry_id: "no-position", created: "2026-09-30 18:00:00", type: "Orca", latitude: "", longitude: "" },
@@ -176,6 +178,7 @@ describe("recorder", () => {
       SUPABASE_SECRET_KEY_FILE: secretFile("key", "test-secret"),
       AISSTREAM_URL: `ws://127.0.0.1:${stub.port}/ws`,
       ACARTIA_URL: `http://127.0.0.1:${stub.port}/acartia`,
+      ACARTIA_POLL_MS: "1000",
       AIS_BBOX: "47.2,-123.6,48.8,-122.1",
       PORT: String(healthPort),
     });
@@ -232,6 +235,21 @@ describe("recorder", () => {
     ]);
   });
 
+  it("only sends whale reports that are new or have changed", { timeout: 10_000 }, async () => {
+    await until(() => stub.acartiaPolls >= 3, 8_000, "more whale polls");
+    assert.equal(stub.whaleUpserts.length, 1); // the feed hasn't changed since the first poll
+    ACARTIA_ROWS[0].no_sighted = 2;
+    ACARTIA_ROWS.push({ ...ACARTIA_ROWS[0], entry_id: "gray-2", no_sighted: 1 });
+    await until(() => stub.whaleUpserts.length === 2, 5_000, "the changed reports");
+    assert.deepEqual(
+      stub.whaleUpserts[1].rows.map((r) => [r.id, r.count]),
+      [
+        ["gray-1", 2],
+        ["gray-2", 1],
+      ],
+    );
+  });
+
   it("serves a health check while the feed is live", async () => {
     const res = await fetch(`http://127.0.0.1:${healthPort}/`);
     assert.equal(res.status, 200);
@@ -256,6 +274,27 @@ describe("recorder", () => {
 });
 
 describe("recorder configuration", () => {
+  it("waits for a secret file that isn't there yet", { timeout: 10_000 }, async () => {
+    const late = join(secretsDir, "late-ais-key");
+    const r = startRecorder({
+      AISSTREAM_API_KEY_FILE: late,
+      SUPABASE_URL: "http://127.0.0.1:9",
+      SUPABASE_SECRET_KEY: "x",
+      AISSTREAM_URL: "ws://127.0.0.1:9/ws",
+      ACARTIA_URL: "off",
+    });
+    await until(() => r.logs.some((l) => String(l.message).startsWith("Waiting for AISSTREAM_API_KEY_FILE")), 5_000, "the wait");
+    writeFileSync(late, "k\n");
+    await until(() => r.logs.some((l) => l.message === "Recorder starting"), 5_000, "start-up");
+    r.child.kill("SIGKILL");
+  });
+
+  it("gives up on a secret file that never appears", { timeout: 10_000 }, async () => {
+    const r = startRecorder({ AISSTREAM_API_KEY_FILE: join(secretsDir, "never"), SECRET_WAIT_MS: "1500", SUPABASE_URL: "http://127.0.0.1:9", SUPABASE_SECRET_KEY: "x" });
+    assert.equal(await r.exited, 1);
+    assert.ok(r.logs.some((l) => l.severity === "ERROR" && String(l.message).includes("AISSTREAM_API_KEY_FILE")));
+  });
+
   it("exits with an error when a required key is missing", async () => {
     const r = startRecorder({ SUPABASE_URL: "http://127.0.0.1:9", SUPABASE_SECRET_KEY: "x" });
     assert.equal(await r.exited, 1);

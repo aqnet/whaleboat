@@ -199,7 +199,9 @@ Create the log-based metric and the two alert policies in §3.4 (console: Loggin
 | Deploy new web code | Re-run the Phase 4 `gcloud run deploy` |
 | Deploy new recorder code | Re-run the Phase 3 `gcloud builds submit`, then `gcloud compute instances reset whaleboat-vm --zone=us-west1-a` (≈ 1 min gap in the feed) |
 | Shell on the VM | `gcloud compute ssh whaleboat-vm --zone=us-west1-a --tunnel-through-iap` |
-| Roll back | `gcloud run services update-traffic whaleboat-web --to-revisions=<rev>=100` |
+| Roll back | `gcloud run services update-traffic whaleboat-web --to-revisions=<rev>=100`  (only the 3 most recent images per service are kept; see below) |
+| Change the VM startup script | Edit `deploy/vm/recorder-startup.sh`, then `gcloud compute instances add-metadata whaleboat-vm --zone=us-west1-a --metadata-from-file=startup-script=deploy/vm/recorder-startup.sh` and reset the VM |
+| Image cleanup | `deploy/artifact-cleanup-policy.json` keeps `latest` and the 3 most recent images per service and deletes the rest after a day, so the repository stays inside the free 0.5 GB. Re-apply with `gcloud artifacts repositories set-cleanup-policies cloud-run-source-deploy --location=us-west1 --policy=deploy/artifact-cleanup-policy.json --no-dry-run` |
 | Schema change | Add a file under `db/migrations/`, apply it to Supabase, then deploy code that uses it |
 | Rotate a key | `gcloud secrets versions add …`, then redeploy the service that uses it |
 | Check the feed | Logs Explorer: `logName:"gcplogs-docker-driver" jsonPayload.message:"heartbeat"` |

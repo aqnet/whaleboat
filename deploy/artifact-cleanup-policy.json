@@ -1,0 +1,17 @@
+[
+  {
+    "name": "keep-latest-tag",
+    "action": { "type": "Keep" },
+    "condition": { "tagState": "TAGGED", "tagPrefixes": ["latest"] }
+  },
+  {
+    "name": "keep-3-most-recent",
+    "action": { "type": "Keep" },
+    "mostRecentVersions": { "keepCount": 3 }
+  },
+  {
+    "name": "delete-older",
+    "action": { "type": "Delete" },
+    "condition": { "tagState": "ANY", "olderThan": "1d" }
+  }
+]

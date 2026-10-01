@@ -24,6 +24,10 @@ if ! command -v docker >/dev/null; then
   systemctl enable --now docker
 fi
 
+# Docker restarts the previous container at boot, before the secrets below
+# exist. Remove it first so it isn't reading them while they are written.
+docker rm -f recorder >/dev/null 2>&1 || true
+
 # Secrets -> memory-backed files readable only by the container's user (node, uid 1000).
 install -d -m 700 -o 1000 -g 1000 "$SECRETS"
 for pair in aisstream-api-key:AISSTREAM_API_KEY supabase-url:SUPABASE_URL supabase-secret-key:SUPABASE_SECRET_KEY; do
@@ -35,7 +39,6 @@ done
 gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin "$REGISTRY"
 docker pull -q "$IMAGE"
 
-docker rm -f recorder >/dev/null 2>&1 || true
 docker run -d --name recorder --restart=always \
   --memory=400m \
   -v "$SECRETS:/secrets:ro" \
