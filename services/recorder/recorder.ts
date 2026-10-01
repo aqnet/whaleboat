@@ -1,4 +1,6 @@
-// Long-running AIS recorder: AISStream WebSocket -> Supabase.
+// Long-running AIS recorder: AISStream WebSocket -> Supabase. It also polls
+// Acartia's whale sightings feed into `whale_sightings`, so reports are kept
+// even when nobody has the map open (the feed only covers ~7 days).
 //
 // The always-on counterpart of scripts/ais-sample.ts. Runs in Docker on the
 // free-tier VM (deploy/vm/, specs/deployment-plan.md); also works as a Cloud
@@ -15,6 +17,7 @@
 //              the whale-watch box from scripts/ais-sample.ts
 //   PORT       if set (Cloud Run *service*), serves a health check on it
 //   AISSTREAM_URL   override the stream endpoint (tests)
+//   ACARTIA_URL     override the whale sightings feed (tests); "off" disables it
 //
 // No dependencies: Node >= 22.18 runs this file directly and has WebSocket
 // and fetch built in. Logs are JSON lines, which Cloud Logging parses.
@@ -44,6 +47,8 @@ const BACKOFF_MIN_MS = 1_000;
 const BACKOFF_MAX_MS = 60_000;
 // Bounds memory if Supabase is unreachable: oldest positions are dropped first.
 const MAX_PENDING = 50_000;
+// The feed keeps ~7 days, so a missed poll or two loses nothing.
+const WHALES_MS = 15 * 60_000;
 
 function log(severity: "INFO" | "WARNING" | "ERROR", message: string, extra: Record<string, unknown> = {}) {
   console.log(JSON.stringify({ severity, message, ...extra, time: new Date().toISOString() }));
@@ -76,6 +81,7 @@ const AIS_KEY = required("AISSTREAM_API_KEY");
 const SUPABASE_URL = required("SUPABASE_URL");
 const SUPABASE_KEY = required("SUPABASE_SECRET_KEY");
 const BBOX = parseBBox(process.env.AIS_BBOX);
+const ACARTIA_URL = process.env.ACARTIA_URL ?? "https://acartia.io/api/v1/sightings/current";
 
 // --- State --------------------------------------------------------------------
 
@@ -87,7 +93,7 @@ let pending: PositionRow[] = [];
 // merges fields, so a row of nulls never erases what the database knows.
 let dirty = new Map<number, VesselRow>();
 
-const stats = { messages: 0, stored: 0, dropped: 0, writeErrors: 0, reconnects: 0 };
+const stats = { messages: 0, stored: 0, dropped: 0, writeErrors: 0, reconnects: 0, whaleSightings: 0, whaleErrors: 0 };
 let lastMessageAt = 0;
 let lastStoreOkAt = 0;
 
@@ -189,6 +195,76 @@ async function flush() {
   }
 }
 
+// --- Whale sightings (Acartia) ---------------------------------------------------
+// Keep in step with parseAcartia() and toRow() in web/lib/acartia.ts, which
+// reads this table and also writes to it when the map is opened.
+
+const WHALE_BOUNDS = { south: 45.5, north: 51, west: -128, east: -121.5 };
+
+function speciesOf(type: string): string {
+  const t = type.toLowerCase();
+  if (/orca|killer/.test(t)) return "Orca";
+  if (/humpback/.test(t)) return "Humpback";
+  if (/gr[ae]y/.test(t)) return "Gray whale";
+  return "Other";
+}
+
+const num = (v: unknown): number | null => {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : null;
+};
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- raw Acartia JSON; fields are checked where used
+function whaleRow(r: any) {
+  const lat = num(r?.latitude);
+  const lon = num(r?.longitude);
+  // `created` is "YYYY-MM-DD HH:MM:SS" in UTC.
+  const m = typeof r?.created === "string" ? r.created.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)/) : null;
+  const ms = m ? Date.parse(`${m[1]}T${m[2]}Z`) : NaN;
+  const id = r?.entry_id ?? r?.ssemmi_id;
+  if (lat == null || lon == null || Number.isNaN(ms) || !id) return null;
+  if (lat < WHALE_BOUNDS.south || lat > WHALE_BOUNDS.north || lon < WHALE_BOUNDS.west || lon > WHALE_BOUNDS.east) return null;
+  const label = typeof r.type === "string" && r.type.trim() ? r.type.trim() : "Unspecified";
+  const count = num(r.no_sighted);
+  return {
+    id: String(id),
+    source: "acartia",
+    seen_at: new Date(ms).toISOString(),
+    species: speciesOf(label),
+    label,
+    count: count && count > 0 ? count : null,
+    lat,
+    lon,
+    verified: r.trusted === 1 || r.trusted === true,
+    comments: typeof r.data_source_comments === "string" ? r.data_source_comments.trim() : "",
+    photo_url: typeof r.photo_url === "string" && /^https:\/\//.test(r.photo_url) ? r.photo_url : null,
+  };
+}
+
+async function pollWhales() {
+  try {
+    const feed = await fetch(ACARTIA_URL, { headers: { "user-agent": "whaleboat-recorder/0.1" }, signal: AbortSignal.timeout(30_000) });
+    if (!feed.ok) throw new Error(`Acartia ${feed.status} ${feed.statusText}`);
+    const body = await feed.json();
+    if (!Array.isArray(body)) throw new Error("Acartia: unexpected response shape");
+    const rows = body.map(whaleRow).filter((r) => r != null);
+    if (rows.length) {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/whale_sightings?on_conflict=id`, {
+        method: "POST",
+        headers: { apikey: SUPABASE_KEY, "content-type": "application/json", prefer: "resolution=merge-duplicates" },
+        body: JSON.stringify(rows),
+        signal: AbortSignal.timeout(20_000),
+      });
+      if (!res.ok) throw new Error(`Supabase ${res.status} ${(await res.text()).slice(0, 300)}`);
+    }
+    stats.whaleSightings = rows.length;
+    log("INFO", "Whale sightings stored", { count: rows.length });
+  } catch (err) {
+    stats.whaleErrors++;
+    log("WARNING", "Whale sightings poll failed", { error: String(err) });
+  }
+}
+
 // --- AISStream ------------------------------------------------------------------
 
 let ws: WebSocket | null = null;
@@ -256,6 +332,11 @@ setInterval(() => {
     ws.close();
   }
 }, 30_000);
+
+if (ACARTIA_URL !== "off") {
+  setInterval(pollWhales, WHALES_MS);
+  setTimeout(pollWhales, 2_000);
+}
 
 // The alert policy in the deployment plan fires when these stop arriving.
 setInterval(() => {
