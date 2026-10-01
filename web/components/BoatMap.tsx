@@ -13,6 +13,8 @@ import type { Fix, SampleFile, SampleSummary, VesselTrack } from "@/lib/ais";
 const WINDOW_ID = "last-48h";
 import { OPERATORS } from "@/lib/whaleWatch";
 import SightingsPanel from "./SightingsPanel";
+import type { WhaleSighting } from "@/lib/acartia";
+import WhalesPanel, { SPECIES_COLORS, ago, filterSightings, useWhaleSightings, type WhaleFilters } from "./WhalesPanel";
 
 // Served from public/ by scripts/copy-maplibre-worker.mjs; the bundler can't resolve it.
 setWorkerUrl("/maplibre/maplibre-gl-worker.mjs");
@@ -87,7 +89,7 @@ function speedColor(sog: number | null): RGB {
 }
 
 type ColorMode = "class" | "speed";
-type PanelTab = "ais" | "sightings";
+type PanelTab = "ais" | "sightings" | "whales";
 
 // ---------------------------------------------------------------------------
 
@@ -139,6 +141,9 @@ export default function BoatMap() {
   const [tab, setTab] = useState<PanelTab>("ais");
   const [selected, setSelected] = useState<number | null>(null);
   const [panelOpen, setPanelOpen] = useState(true);
+  const whales = useWhaleSightings();
+  const [whaleFilters, setWhaleFilters] = useState<WhaleFilters>({ days: 7, species: new Set(), verifiedOnly: false, onMap: true });
+  const [selectedWhale, setSelectedWhale] = useState<string | null>(null);
   const deckRef = useRef<AttachedOverlay | null>(null);
   const [, setDeckAttached] = useState(0);
 
@@ -193,6 +198,11 @@ export default function BoatMap() {
   );
   const fixes = useMemo<FixDatum[]>(() => vessels.flatMap((v) => v.fixes.map((f) => ({ ...f, vessel: v }))), [vessels]);
 
+  const whaleMarks = useMemo(
+    () => (whaleFilters.onMap && whales.data ? filterSightings(whales.data.sightings, whaleFilters, Date.parse(whales.data.fetchedAt) / 1000) : []),
+    [whales.data, whaleFilters],
+  );
+
   const alphaFor = (mmsi: number) => (selected == null || selected === mmsi ? 255 : 70);
   const classColor = (v: VesselTrack) => CLASS_COLORS[theme][v.cls];
 
@@ -235,10 +245,44 @@ export default function BoatMap() {
       onClick: ({ object }) => object && setSelected(object.vessel.mmsi),
       updateTriggers: { getFillColor: [colorMode, selected, theme], getRadius: [selected], getLineColor: [theme] },
     }),
+    // Whale reports sit on top of the boats: bigger dots, colored by species,
+    // fading with age. "Other" species have no hue and are drawn as rings.
+    new ScatterplotLayer<WhaleSighting>({
+      id: "whales",
+      data: whaleMarks,
+      getPosition: (d) => [d.lon, d.lat],
+      getRadius: (d) => (d.id === selectedWhale ? 11 : 8),
+      radiusUnits: "pixels",
+      stroked: true,
+      lineWidthUnits: "pixels",
+      getLineWidth: (d) => (d.id === selectedWhale ? 3 : 2),
+      getFillColor: (d) => {
+        const c = SPECIES_COLORS[theme][d.species];
+        return c ? [...hex(c), whaleAlpha(d.t)] : [0, 0, 0, 0];
+      },
+      getLineColor: (d) =>
+        d.id === selectedWhale || !SPECIES_COLORS[theme][d.species] ? [...INK[theme], whaleAlpha(d.t)] : [...SURFACE[theme], 230],
+      pickable: true,
+      autoHighlight: true,
+      highlightColor: [255, 255, 255, 120],
+      onClick: ({ object }) => object && setSelectedWhale(object.id),
+      updateTriggers: { getFillColor: [theme], getLineColor: [theme, selectedWhale], getRadius: [selectedWhale], getLineWidth: [selectedWhale] },
+    }),
   ];
 
   const getTooltip = ({ object, layer }: PickingInfo) => {
     if (!object) return null;
+    if (layer?.id === "whales") {
+      const w = object as WhaleSighting;
+      const esc = (t: string) => t.replace(/[&<>"]/g, (ch) => `&#${ch.charCodeAt(0)};`);
+      return {
+        html:
+          `<b>${esc(w.label)}${w.count && w.count > 1 ? ` × ${w.count}` : ""}</b>${w.verified ? " · verified" : ""}` +
+          `<br/>${fmtDate(w.t)} · ${ago(w.t)}` +
+          (w.comments ? `<br/><span style="display:inline-block;max-width:260px;white-space:normal">${esc(w.comments)}</span>` : ""),
+        style: tooltipStyle(theme),
+      };
+    }
     const v: VesselTrack = object.vessel;
     const ww = v.whaleWatch ? `<br/>Whale watch · ${v.whaleWatch.operator}${v.whaleWatch.confirmed ? "" : " (unconfirmed)"}` : "";
     const head = `<b>${v.name || "(no name)"}</b>${ww}<br/>MMSI ${v.mmsi} · Class ${v.cls} · ${shipTypeLabel(v.shipType)}${v.lengthM ? ` · ${v.lengthM} m` : ""}`;
@@ -259,7 +303,11 @@ export default function BoatMap() {
     layers,
     getTooltip,
     // Clicking empty map clears the selection; clicks on marks are handled per layer.
-    onClick: (info) => !info.object && setSelected(null),
+    onClick: (info) => {
+      if (info.object) return;
+      setSelected(null);
+      setSelectedWhale(null);
+    },
   };
 
   // Push the current layers to the attached overlay after every render.
@@ -311,7 +359,12 @@ export default function BoatMap() {
     else mapRef.current?.fitBounds([[w, s], [e, n]], { padding: 80, maxZoom: 14 });
   };
 
-  // Sighting logs are kept by local calendar day.
+  const focusWhale = (w: WhaleSighting) => {
+    setSelectedWhale(w.id);
+    if (!whaleFilters.onMap) setWhaleFilters({ ...whaleFilters, onMap: true });
+    mapRef.current?.flyTo({ center: [w.lon, w.lat], zoom: Math.max(mapRef.current.getZoom(), 11) });
+  };
+
   // The newest day on the map, in local (Pacific) time: sighting logs are kept by day.
   const sampleDate = data?.end ? new Date(data.end * 1000).toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" }) : null;
 
@@ -390,12 +443,29 @@ export default function BoatMap() {
             <Tab id="sightings" active={tab === "sightings"} onClick={() => setTab("sightings")} secondary={secondary}>
               Sightings
             </Tab>
+            <Tab id="whales" active={tab === "whales"} onClick={() => setTab("whales")} secondary={secondary}>
+              Acartia
+            </Tab>
           </div>
         )}
 
         {panelOpen && tab === "sightings" && (
           <div role="tabpanel" id="panel-sightings" aria-labelledby="tab-sightings" className="flex min-h-0 flex-col px-4 pb-4 pt-3 text-sm">
             <SightingsPanel sampleDate={sampleDate} theme={theme} secondary={secondary} />
+          </div>
+        )}
+
+        {panelOpen && tab === "whales" && (
+          <div role="tabpanel" id="panel-whales" aria-labelledby="tab-whales" className="flex min-h-0 flex-col px-4 pb-4 pt-3 text-sm">
+            <WhalesPanel
+              {...whales}
+              filters={whaleFilters}
+              setFilters={setWhaleFilters}
+              selected={selectedWhale}
+              onFocus={focusWhale}
+              theme={theme}
+              secondary={secondary}
+            />
           </div>
         )}
 
@@ -617,6 +687,12 @@ function WhaleWatchRoster({
       ))}
     </div>
   );
+}
+
+// Today's reports are solid; a month-old one is faint.
+function whaleAlpha(t: number): number {
+  const days = (Date.now() / 1000 - t) / 86400;
+  return Math.round(255 - Math.min(1, Math.max(0, (days - 1) / 29)) * 135);
 }
 
 function tooltipStyle(theme: "light" | "dark") {
