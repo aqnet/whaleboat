@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import MapGL, { Layer, Source, NavigationControl, ScaleControl, type MapRef } from "react-map-gl/maplibre";
 import { MapboxOverlay, type MapboxOverlayProps } from "@deck.gl/mapbox";
-import { PathLayer, ScatterplotLayer } from "@deck.gl/layers";
+import { IconLayer, PathLayer, ScatterplotLayer } from "@deck.gl/layers";
 import type { PickingInfo } from "@deck.gl/core";
 import { setWorkerUrl, type Map as MapLibreMap } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
@@ -14,7 +14,18 @@ const WINDOW_ID = "last-48h";
 import { OPERATORS } from "@/lib/whaleWatch";
 import SightingsPanel from "./SightingsPanel";
 import type { WhaleSighting } from "@/lib/acartia";
-import WhalesPanel, { SPECIES_COLORS, ago, filterSightings, useWhaleSightings, type WhaleFilters } from "./WhalesPanel";
+import type { Bout, Hydrophone } from "@/lib/orcasound";
+import WhalesPanel, {
+  SPECIES_COLORS,
+  ago,
+  boutsInWindow,
+  filterSightings,
+  useAcoustic,
+  useWhaleSightings,
+  windowLabel,
+  type WhaleFilters,
+  type WhaleView,
+} from "./WhalesPanel";
 
 // Served from public/ by scripts/copy-maplibre-worker.mjs; the bundler can't resolve it.
 setWorkerUrl("/maplibre/maplibre-gl-worker.mjs");
@@ -106,6 +117,16 @@ type AttachedOverlay = { map: MapLibreMap; overlay: MapboxOverlay; retries: numb
 const MAX_DECK_RETRIES = 5;
 
 type FixDatum = Fix & { vessel: VesselTrack };
+type HydrophoneDatum = Hydrophone & { bouts: Bout[] };
+
+// Hydrophone marker: a diamond, tinted per layer (mask).
+const DIAMOND = {
+  id: "diamond",
+  url: `data:image/svg+xml;charset=utf-8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M16 1 31 16 16 31 1 16Z" fill="#fff"/></svg>')}`,
+  width: 32,
+  height: 32,
+  mask: true,
+};
 type PathDatum = { vessel: VesselTrack; path: [number, number][]; sogs: (number | null)[] };
 
 const fmtDate = (t: number) => new Date(t * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
@@ -142,8 +163,17 @@ export default function BoatMap() {
   const [selected, setSelected] = useState<number | null>(null);
   const [panelOpen, setPanelOpen] = useState(true);
   const whales = useWhaleSightings();
-  const [whaleFilters, setWhaleFilters] = useState<WhaleFilters>({ days: 7, species: new Set(), verifiedOnly: false, onMap: true });
+  const acoustic = useAcoustic();
+  const [whaleFilters, setWhaleFilters] = useState<WhaleFilters>({
+    days: 7,
+    species: new Set(),
+    verifiedOnly: false,
+    onMap: true,
+    hydrophonesOnMap: true,
+  });
+  const [whaleView, setWhaleView] = useState<WhaleView>("seen");
   const [selectedWhale, setSelectedWhale] = useState<string | null>(null);
+  const [selectedHydrophone, setSelectedHydrophone] = useState<string | null>(null);
   const deckRef = useRef<AttachedOverlay | null>(null);
   const [, setDeckAttached] = useState(0);
 
@@ -203,6 +233,13 @@ export default function BoatMap() {
     [whales.data, whaleFilters],
   );
 
+  // Hydrophones with the bouts heard on each in the time range, newest first.
+  const hydrophoneMarks = useMemo<HydrophoneDatum[]>(() => {
+    if (!whaleFilters.hydrophonesOnMap || !acoustic.data) return [];
+    const recent = boutsInWindow(acoustic.data.bouts, whaleFilters.days, Date.parse(acoustic.data.fetchedAt) / 1000);
+    return acoustic.data.hydrophones.map((h) => ({ ...h, bouts: recent.filter((b) => b.hydrophoneId === h.id) }));
+  }, [acoustic.data, whaleFilters]);
+
   const alphaFor = (mmsi: number) => (selected == null || selected === mmsi ? 255 : 70);
   const classColor = (v: VesselTrack) => CLASS_COLORS[theme][v.cls];
 
@@ -245,6 +282,52 @@ export default function BoatMap() {
       onClick: ({ object }) => object && setSelected(object.vessel.mmsi),
       updateTriggers: { getFillColor: [colorMode, selected, theme], getRadius: [selected], getLineColor: [theme] },
     }),
+    // Hydrophones: a diamond (on a surface-colored diamond, so it reads over
+    // tracks), ringed in the species color of the latest call heard there.
+    new ScatterplotLayer<HydrophoneDatum>({
+      id: "hydrophone-rings",
+      data: hydrophoneMarks.filter((h) => h.bouts.length),
+      getPosition: (d) => [d.lon, d.lat],
+      getRadius: 13,
+      radiusUnits: "pixels",
+      filled: false,
+      stroked: true,
+      lineWidthUnits: "pixels",
+      getLineWidth: 3,
+      getLineColor: (d) => {
+        const c = SPECIES_COLORS[theme][d.bouts[0].species];
+        return c ? [...hex(c), 255] : [...INK[theme], 255];
+      },
+      updateTriggers: { getLineColor: [theme] },
+    }),
+    new IconLayer<HydrophoneDatum>({
+      id: "hydrophone-halo",
+      data: hydrophoneMarks,
+      getPosition: (d) => [d.lon, d.lat],
+      getIcon: () => DIAMOND,
+      getSize: (d) => (d.id === selectedHydrophone ? 24 : 19),
+      getColor: () => [...SURFACE[theme], 240],
+      updateTriggers: { getColor: [theme], getSize: [selectedHydrophone] },
+    }),
+    new IconLayer<HydrophoneDatum>({
+      id: "hydrophones",
+      data: hydrophoneMarks,
+      getPosition: (d) => [d.lon, d.lat],
+      getIcon: () => DIAMOND,
+      getSize: (d) => (d.id === selectedHydrophone ? 18 : 14),
+      getColor: (d) => (d.bouts.length ? [...INK[theme], 255] : [137, 135, 129, 255]),
+      pickable: true,
+      autoHighlight: true,
+      highlightColor: [255, 255, 255, 120],
+      onClick: ({ object }) => {
+        if (!object) return;
+        setSelectedHydrophone(object.id);
+        setWhaleView("heard");
+        setTab("whales");
+        setPanelOpen(true);
+      },
+      updateTriggers: { getColor: [theme], getSize: [selectedHydrophone] },
+    }),
     // Whale reports sit on top of the boats: bigger dots, colored by species,
     // fading with age. "Other" species have no hue and are drawn as rings.
     new ScatterplotLayer<WhaleSighting>({
@@ -272,6 +355,20 @@ export default function BoatMap() {
 
   const getTooltip = ({ object, layer }: PickingInfo) => {
     if (!object) return null;
+    if (layer?.id === "hydrophones") {
+      const h = object as HydrophoneDatum;
+      const esc = (t: string) => t.replace(/[&<>"]/g, (ch) => `&#${ch.charCodeAt(0)};`);
+      const span = windowLabel(whaleFilters.days);
+      const latest = h.bouts[0];
+      return {
+        html:
+          `<b>${esc(h.name)}</b> · hydrophone<br/>` +
+          (latest
+            ? `Whale calls heard ${h.bouts.length} time${h.bouts.length === 1 ? "" : "s"} in the last ${span}<br/>Latest: ${esc(latest.name)}, ${ago(latest.start)}`
+            : `No whale calls identified in the last ${span}`),
+        style: tooltipStyle(theme),
+      };
+    }
     if (layer?.id === "whales") {
       const w = object as WhaleSighting;
       const esc = (t: string) => t.replace(/[&<>"]/g, (ch) => `&#${ch.charCodeAt(0)};`);
@@ -307,6 +404,7 @@ export default function BoatMap() {
       if (info.object) return;
       setSelected(null);
       setSelectedWhale(null);
+      setSelectedHydrophone(null);
     },
   };
 
@@ -357,6 +455,12 @@ export default function BoatMap() {
     const [w, e, s, n] = [Math.min(...lons), Math.max(...lons), Math.min(...lats), Math.max(...lats)];
     if (e - w < 0.005 && n - s < 0.005) mapRef.current?.flyTo({ center: [w, s], zoom: 14 });
     else mapRef.current?.fitBounds([[w, s], [e, n]], { padding: 80, maxZoom: 14 });
+  };
+
+  const focusHydrophone = (h: Hydrophone) => {
+    setSelectedHydrophone(h.id);
+    if (!whaleFilters.hydrophonesOnMap) setWhaleFilters({ ...whaleFilters, hydrophonesOnMap: true });
+    mapRef.current?.flyTo({ center: [h.lon, h.lat], zoom: Math.max(mapRef.current.getZoom(), 11) });
   };
 
   const focusWhale = (w: WhaleSighting) => {
@@ -444,7 +548,7 @@ export default function BoatMap() {
               Sightings
             </Tab>
             <Tab id="whales" active={tab === "whales"} onClick={() => setTab("whales")} secondary={secondary}>
-              Acartia
+              Whale Location
             </Tab>
           </div>
         )}
@@ -458,7 +562,13 @@ export default function BoatMap() {
         {panelOpen && tab === "whales" && (
           <div role="tabpanel" id="panel-whales" aria-labelledby="tab-whales" className="flex min-h-0 flex-col px-4 pb-4 pt-3 text-sm">
             <WhalesPanel
-              {...whales}
+              sightings={whales}
+              acoustic={acoustic}
+              view={whaleView}
+              setView={setWhaleView}
+              selectedHydrophone={selectedHydrophone}
+              setSelectedHydrophone={setSelectedHydrophone}
+              onFocusHydrophone={focusHydrophone}
               filters={whaleFilters}
               setFilters={setWhaleFilters}
               selected={selectedWhale}
