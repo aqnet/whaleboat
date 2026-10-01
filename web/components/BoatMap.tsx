@@ -5,7 +5,7 @@ import MapGL, { Layer, Source, NavigationControl, ScaleControl, type MapRef } fr
 import { MapboxOverlay, type MapboxOverlayProps } from "@deck.gl/mapbox";
 import { IconLayer, PathLayer, ScatterplotLayer } from "@deck.gl/layers";
 import type { PickingInfo } from "@deck.gl/core";
-import { setWorkerUrl, type Map as MapLibreMap } from "maplibre-gl";
+import { GeolocateControl, setWorkerUrl, type Map as MapLibreMap } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import type { Fix, SampleFile, SampleSummary, VesselTrack } from "@/lib/ais";
 
@@ -174,6 +174,9 @@ export default function BoatMap() {
   const [whaleView, setWhaleView] = useState<WhaleView>("seen");
   const [selectedWhale, setSelectedWhale] = useState<string | null>(null);
   const [selectedHydrophone, setSelectedHydrophone] = useState<string | null>(null);
+  // Shown briefly when the location button can't find the user.
+  const [locateError, setLocateError] = useState<string | null>(null);
+  const locateTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const deckRef = useRef<AttachedOverlay | null>(null);
   const [, setDeckAttached] = useState(0);
 
@@ -447,6 +450,53 @@ export default function BoatMap() {
     }, 2000);
   };
 
+  // Location button, below the zoom buttons. Nothing is asked for until it is
+  // tapped. Like Google and Apple Maps, the first tap centers on the user and
+  // follows them; panning away stops following (the dot stays); tapping again
+  // re-centers. Added by hand once per map, like the deck overlay: under
+  // Strict Mode react-map-gl's <GeolocateControl> re-adds the same control,
+  // which attaches two click handlers and a tap turns it on and off again.
+  const locateMap = useRef<MapLibreMap | null>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const attachLocate = (map: MapLibreMap) => {
+    if (locateMap.current === map) return;
+    locateMap.current = map;
+    const control = new GeolocateControl({
+      trackUserLocation: true,
+      showAccuracyCircle: true,
+      positionOptions: { enableHighAccuracy: true, timeout: 10_000 },
+    });
+    // Center the dot in the part of the map the panel doesn't cover (the
+    // bottom sheet on phones). Read on every camera move, so it follows the
+    // panel being hidden or resized.
+    Object.defineProperty(control.options, "fitBoundsOptions", {
+      get: () => {
+        const r = panelRef.current?.getBoundingClientRect();
+        const m = 40;
+        if (!r) return { maxZoom: 13 };
+        const phone = window.innerWidth < 640;
+        return {
+          maxZoom: 13,
+          padding: phone
+            ? { top: m, left: m, right: m, bottom: Math.max(m, window.innerHeight - r.top + 16) }
+            : { top: m, right: m, bottom: m, left: Math.max(m, r.right + 16) },
+        };
+      },
+    });
+    control.on("geolocate", () => setLocateError(null));
+    control.on("error", (e) => {
+      console.warn("geolocate:", e.code, e.message);
+      setLocateError(
+        e.code === 1
+          ? "Location access is off for this site. Allow it in your browser settings to see where you are."
+          : "Couldn't find your location right now. Please try again.",
+      );
+      if (locateTimer.current) clearTimeout(locateTimer.current);
+      locateTimer.current = setTimeout(() => setLocateError(null), 6000);
+    });
+    map.addControl(control, "top-right");
+  };
+
   const focusVessel = (v: VesselTrack) => {
     setSelected(v.mmsi);
     if (!v.fixes.length) return;
@@ -484,7 +534,10 @@ export default function BoatMap() {
         initialViewState={INITIAL_VIEW}
         mapStyle={BASEMAPS[basemap].url}
         style={{ width: "100%", height: "100%" }}
-        onLoad={(e) => attachDeck(e.target)}
+        onLoad={(e) => {
+          attachDeck(e.target);
+          attachLocate(e.target);
+        }}
         onStyleData={(e) => setDepthAnchorReady(Boolean(e.target.getLayer(DEPTH_BEFORE)))}
       >
         {basemap === "depth" && depthAnchorReady && (
@@ -524,8 +577,18 @@ export default function BoatMap() {
         <ScaleControl position="bottom-right" unit="nautical" />
       </MapGL>
 
+      {locateError && (
+        <p
+          role="status"
+          className={`absolute right-14 top-3 z-20 max-w-64 rounded-lg border px-3 py-2 text-sm shadow-lg ${panelBg} ${ink}`}
+        >
+          {locateError}
+        </p>
+      )}
+
       {/* Control panel: top-left on desktop, bottom sheet on phones */}
       <div
+        ref={panelRef}
         className={`absolute z-10 flex flex-col border shadow-lg backdrop-blur ${panelBg} ${ink}
           inset-x-2 bottom-2 max-h-[55dvh] rounded-2xl
           sm:inset-x-auto sm:bottom-auto sm:left-3 sm:top-3 sm:w-80 sm:max-h-[calc(100dvh-1.5rem)]`}
