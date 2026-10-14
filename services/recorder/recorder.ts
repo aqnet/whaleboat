@@ -19,6 +19,8 @@
 //   AISSTREAM_URL   override the stream endpoint (tests)
 //   ACARTIA_URL     override the whale sightings feed (tests); "off" disables it
 //   ACARTIA_POLL_MS override the 15-minute poll interval (tests)
+//   AIS_STALE_MS    override the 3-minute silence limit (tests)
+//   AIS_BACKOFF_MAX_MS  override the 60-second reconnect delay cap (tests)
 //   SECRET_WAIT_MS  how long to wait for a *_FILE to become readable (default 60 s)
 //
 // No dependencies: Node >= 22.18 runs this file directly and has WebSocket
@@ -44,9 +46,9 @@ const FLUSH_MS = 5_000;
 const HEARTBEAT_MS = 5 * 60_000;
 // AISStream can go quiet without closing the socket. Traffic in this box never
 // stops for this long, so silence means the connection is dead.
-const STALE_MS = 3 * 60_000;
+const STALE_MS = Number(process.env.AIS_STALE_MS) || 3 * 60_000;
 const BACKOFF_MIN_MS = 1_000;
-const BACKOFF_MAX_MS = 60_000;
+const BACKOFF_MAX_MS = Number(process.env.AIS_BACKOFF_MAX_MS) || 60_000;
 // Bounds memory if Supabase is unreachable: oldest positions are dropped first.
 const MAX_PENDING = 50_000;
 // The feed keeps ~7 days, so a missed poll or two loses nothing.
@@ -303,6 +305,10 @@ async function pollWhales() {
 let ws: WebSocket | null = null;
 let backoff = BACKOFF_MIN_MS;
 let stopping = false;
+// When the current socket was opened or last heard from. Drives the stale
+// check, so an attempt that never opens is abandoned too.
+let lastAliveAt = 0;
+let startedAt = 0;
 const decoder = new TextDecoder();
 
 function connect() {
@@ -310,12 +316,12 @@ function connect() {
   const socket = new WebSocket(process.env.AISSTREAM_URL ?? "wss://stream.aisstream.io/v0/stream");
   socket.binaryType = "arraybuffer";
   ws = socket;
-  const openedAt = Date.now();
+  lastAliveAt = startedAt = Date.now();
 
   socket.addEventListener("open", () => {
     // AISStream closes the socket if the subscription isn't sent within 3 s.
     socket.send(JSON.stringify({ APIKey: AIS_KEY, BoundingBoxes: [BBOX], FilterMessageTypes: MESSAGE_TYPES }));
-    lastMessageAt = Date.now();
+    lastMessageAt = lastAliveAt = Date.now();
     log("INFO", "Connected to AISStream", { bbox: BBOX });
   });
 
@@ -329,30 +335,43 @@ function connect() {
     }
     if (msg.error) {
       log("ERROR", "AISStream error", { error: msg.error });
-      socket.close();
+      replace(socket, "AISStream error; reconnecting");
       return;
     }
     stats.messages++;
-    lastMessageAt = Date.now();
+    lastMessageAt = lastAliveAt = Date.now();
     handle(msg);
   });
 
+  // A failed handshake fires "error" and, in Node 22, sometimes never "close".
+  // Waiting for "close" left the recorder stuck for six days (2026-10-07), so
+  // an error replaces the socket by itself.
   socket.addEventListener("error", (ev) => {
     log("WARNING", "WebSocket error", { error: (ev as ErrorEvent).message ?? ev.type });
+    replace(socket, "AISStream socket failed; reconnecting");
   });
 
   socket.addEventListener("close", (ev) => {
-    if (ws !== socket) return;
-    ws = null;
-    if (stopping) return;
-    // A connection that lasted a while was healthy: start the backoff over.
-    if (Date.now() - openedAt > 60_000) backoff = BACKOFF_MIN_MS;
-    const wait = Math.round(backoff * (0.5 + Math.random()));
-    backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
-    stats.reconnects++;
-    log("WARNING", "AISStream socket closed; reconnecting", { code: ev.code, reason: ev.reason, wait_ms: wait });
-    setTimeout(connect, wait);
+    replace(socket, "AISStream socket closed; reconnecting", { code: ev.code, reason: ev.reason });
   });
+}
+
+// Drops `socket` and schedules a new connection. Every path that gives up on a
+// socket comes through here; it acts once per socket, whichever comes first.
+function replace(socket: WebSocket, message: string, extra: Record<string, unknown> = {}) {
+  if (ws !== socket) return;
+  ws = null;
+  try {
+    socket.close();
+  } catch {}
+  if (stopping) return;
+  // A connection that lasted a while was healthy: start the backoff over.
+  if (Date.now() - startedAt > 60_000) backoff = BACKOFF_MIN_MS;
+  const wait = Math.round(backoff * (0.5 + Math.random()));
+  backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
+  stats.reconnects++;
+  log("WARNING", message, { ...extra, wait_ms: wait });
+  setTimeout(connect, wait);
 }
 
 // --- Timers -------------------------------------------------------------------
@@ -360,11 +379,11 @@ function connect() {
 setInterval(flush, FLUSH_MS);
 
 setInterval(() => {
-  if (ws && lastMessageAt && Date.now() - lastMessageAt > STALE_MS) {
-    log("WARNING", "No AIS messages recently; forcing a reconnect", { quiet_s: Math.round((Date.now() - lastMessageAt) / 1000) });
-    ws.close();
+  if (ws && Date.now() - lastAliveAt > STALE_MS) {
+    log("WARNING", "No AIS messages recently; forcing a reconnect", { quiet_s: Math.round((Date.now() - lastAliveAt) / 1000) });
+    replace(ws, "Stale AISStream socket replaced; reconnecting");
   }
-}, 30_000);
+}, Math.min(30_000, STALE_MS / 2));
 
 if (ACARTIA_URL !== "off") {
   setInterval(pollWhales, WHALES_MS);

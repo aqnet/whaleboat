@@ -77,7 +77,7 @@ GCP project (region us-west1)                        Supabase project
 - One dependency-free TypeScript file run directly by Node 22.
 - Subscribes to one box covering Port Angeles east to Everett and Tacoma north to the San Juans (`AIS_BBOX` overrides it).
 - Flushes to `ingest_ais()` every 5 s. A failed write is retried with the next batch; at most 50,000 positions are held in memory.
-- Reconnects with exponential backoff and jitter (1 s → 60 s), and forces a reconnect after 3 min of silence.
+- Reconnects with exponential backoff and jitter (1 s → 60 s). Any socket error, close, or 3 min of silence (including a handshake that never completes) replaces the socket; it never waits on a `close` event, which Node 22 skips after a refused handshake (that stalled the feed 2026-10-07 → 10-14).
 - Logs JSON lines, with a `heartbeat` entry every 5 min carrying message, stored, dropped and error counts.
 - On SIGTERM it flushes and exits within Cloud Run's 10 s window.
 
