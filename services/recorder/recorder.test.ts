@@ -38,6 +38,11 @@ class Stub {
   subscriptions: Record<string, unknown>[] = [];
   batches: Batch[] = [];
   failNextWrites = 0;
+  /** Upgrades to answer with a 503 instead of 101, like AISStream did on 2026-10-07. */
+  refuseUpgrades = 0;
+  /** Upgrades to leave unanswered: the handshake never completes. */
+  hangUpgrades = 0;
+  upgradeAttempts = 0;
   acartiaPolls = 0;
   whaleUpserts: { url: string | undefined; prefer: string | undefined; rows: Record<string, unknown>[] }[] = [];
 
@@ -77,9 +82,19 @@ class Stub {
   }
 
   private upgrade(req: IncomingMessage, socket: Duplex) {
+    this.upgradeAttempts++;
+    socket.on("error", () => {});
+    if (this.refuseUpgrades > 0) {
+      this.refuseUpgrades--;
+      return void socket.end("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    }
+    if (this.hangUpgrades > 0) {
+      this.hangUpgrades--;
+      this.sockets.push(socket); // destroyed by stop()
+      return;
+    }
     const accept = createHash("sha1").update(`${req.headers["sec-websocket-key"]}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
     socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
-    socket.on("error", () => {});
     socket.once("data", (frame: Buffer) => this.subscriptions.push(JSON.parse(unmask(frame))));
     this.sockets.push(socket);
   }
@@ -270,6 +285,53 @@ describe("recorder", () => {
     assert.equal(await rec.exited, 0);
     assert.equal(stub.positions().length, before + 1);
     assert.equal(stub.positions().at(-1)!.mmsi, 338000001);
+  });
+});
+
+// The recorder must never stop trying, however a connection attempt fails.
+// Its own recorder, with a short silence limit the main suite can't use.
+describe("recorder recovery", () => {
+  const stub = new Stub();
+  let rec: ReturnType<typeof startRecorder>;
+  const connected = () => rec.logs.filter((l) => l.message === "Connected to AISStream").length;
+
+  before(async () => {
+    await stub.start();
+    rec = startRecorder({
+      AISSTREAM_API_KEY: "k",
+      SUPABASE_URL: `http://127.0.0.1:${stub.port}`,
+      SUPABASE_SECRET_KEY: "x",
+      AISSTREAM_URL: `ws://127.0.0.1:${stub.port}/ws`,
+      ACARTIA_URL: "off",
+      AIS_STALE_MS: "2000",
+      AIS_BACKOFF_MAX_MS: "1000",
+    });
+    await until(() => connected() === 1, 5_000, "the first connection");
+  });
+
+  after(() => {
+    rec.child.kill("SIGKILL");
+    stub.stop();
+  });
+
+  it("keeps retrying after reconnects are refused", { timeout: 20_000 }, async () => {
+    stub.refuseUpgrades = 2;
+    stub.sockets.at(-1)!.destroy();
+    await until(() => connected() === 2, 15_000, "a connection after two refusals");
+    assert.equal(stub.refuseUpgrades, 0);
+  });
+
+  it("abandons a handshake that never completes", { timeout: 20_000 }, async () => {
+    const before = connected();
+    stub.hangUpgrades = 1;
+    stub.sockets.at(-1)!.destroy();
+    await until(() => connected() === before + 1, 15_000, "a connection after a hung handshake");
+    assert.ok(rec.logs.some((l) => l.message === "Stale AISStream socket replaced; reconnecting"));
+  });
+
+  it("replaces a socket that goes quiet", { timeout: 10_000 }, async () => {
+    const before = connected();
+    await until(() => connected() === before + 1, 8_000, "a fresh connection after silence");
   });
 });
 
