@@ -14,11 +14,10 @@ updates:
     open-pull-requests-limit: 5
     groups:
       # One PR a week for routine bumps instead of one per package.
+      # Security fixes are deliberately not grouped: Dependabot reports no
+      # update type for grouped security PRs, so they could never auto-merge.
       npm-minor-and-patch:
         applies-to: version-updates
-        update-types: [minor, patch]
-      npm-security:
-        applies-to: security-updates
         update-types: [minor, patch]
     ignore:
       # deck.gl is pinned to 9.3.x: luma.gl 9.4 breaks the boat layer on the
