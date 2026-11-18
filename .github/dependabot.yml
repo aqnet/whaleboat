@@ -1,0 +1,57 @@
+# Dependabot version and security updates. Free on public repos.
+# Patch and minor updates merge on their own once CI passes
+# (.github/workflows/dependabot-auto-merge.yml). Majors wait for a human.
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 5
+    groups:
+      # One PR a week for routine bumps instead of one per package.
+      npm-minor-and-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+      npm-security:
+        applies-to: security-updates
+        update-types: [minor, patch]
+    ignore:
+      # deck.gl is pinned to 9.3.x: luma.gl 9.4 breaks the boat layer on the
+      # VMware SVGA3D driver. Retest on real GPU before lifting this.
+      - dependency-name: "@deck.gl/*"
+        update-types: [version-update:semver-minor, version-update:semver-major]
+      - dependency-name: "@luma.gl/*"
+        update-types: [version-update:semver-minor, version-update:semver-major]
+      # Types track the Node runtime we deploy, not the latest Node.
+      - dependency-name: "@types/node"
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: docker
+    directories:
+      - /web
+      - /services/recorder
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Los_Angeles
+    ignore:
+      # Stay on Node 22 (package.json engines); move majors deliberately.
+      - dependency-name: node
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Los_Angeles
+    groups:
+      actions:
+        update-types: [minor, patch]
